@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { assignmentBlocks, pacedDemand } from './demand';
+import { assignmentBlocks, keyOf, pacedDemand } from './demand';
 import type { Model } from './types';
 
 const base: Model = {
@@ -81,5 +81,17 @@ describe('pacedDemand', () => {
       remaining, [], new Map([['2026-09', 5]]), new Map([['2026-09', 5]]),
     );
     expect(got.map((d) => d.otlProjectCode)).toEqual(['P-1002', 'P-1003', 'P-1001']);
+  });
+
+  it('round-trips an OTL project code containing a pipe character without dropping it', () => {
+    // OTL codes are free text typed on the Setup page and may contain '|'.
+    // keyOf joins with '|', so pacedDemand must not split naively on it.
+    const otlWithPipe = 'P-1001|SUB-A';
+    const key = keyOf('2026-09', otlWithPipe);
+    const remaining = new Map([[key, 20]]);
+    const got = pacedDemand(
+      remaining, [], new Map([['2026-09', 5]]), new Map([['2026-09', 5]]),
+    );
+    expect(got).toEqual([{ otlProjectCode: otlWithPipe, month: '2026-09', blocks: 20 }]);
   });
 });

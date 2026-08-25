@@ -38,12 +38,12 @@ export function pacedDemand(
   for (const [key, blocks] of remaining) {
     if (blocks <= 0) continue;
 
-    // Guard: validate split result and narrow types
-    const parts = key.split('|');
-    if (parts.length !== 2) continue;
-    const month = parts[0];
-    const otlProjectCode = parts[1];
-    if (month === undefined || otlProjectCode === undefined) continue;
+    // Parse on the first delimiter only: OTL codes are free text and may
+    // themselves contain '|'. The month is always fixed-width 'YYYY-MM'.
+    const sep = key.indexOf('|');
+    if (sep === -1) continue;
+    const month = key.slice(0, sep);
+    const otlProjectCode = key.slice(sep + 1);
 
     const weekDays = weekWorkdaysByMonth.get(month) ?? 0;
     if (weekDays === 0) continue;
