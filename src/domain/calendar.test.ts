@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   mondayOf, weekDays, weeksTouchingMonth, monthOf,
-  datesInRange, addDays, formatWeekRange,
+  datesInRange, addDays, formatWeekRange, formatDayHeader,
 } from './calendar';
 
 describe('mondayOf', () => {
@@ -86,5 +86,21 @@ describe('formatWeekRange', () => {
 
   it('omits the repeated month within one month', () => {
     expect(formatWeekRange('2026-09-07')).toBe('7 – 11 Sep 2026');
+  });
+});
+
+describe('formatDayHeader', () => {
+  it('formats a normal weekday with correct day name and month abbreviation', () => {
+    expect(formatDayHeader('2026-09-01')).toBe('Tue 1 Sep');
+  });
+
+  it('correctly indexes the weekday name at both ends of working week', () => {
+    expect(formatDayHeader('2026-08-31')).toBe('Mon 31 Aug');
+    expect(formatDayHeader('2026-09-04')).toBe('Fri 4 Sep');
+  });
+
+  it('proves month lookup is correct across month boundaries', () => {
+    expect(formatDayHeader('2026-09-30')).toBe('Wed 30 Sep');
+    expect(formatDayHeader('2026-10-01')).toBe('Thu 1 Oct');
   });
 });

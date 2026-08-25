@@ -22,6 +22,12 @@ describe('hoursToBlocks', () => {
     expect(hoursToBlocks(37.5)).toEqual({ blocks: 75, residualHours: 0 });
     expect(hoursToBlocks(2.5 * 3)).toEqual({ blocks: 15, residualHours: 0 });
   });
+
+  it('treats non-finite input as zero rather than propagating NaN', () => {
+    expect(hoursToBlocks(NaN)).toEqual({ blocks: 0, residualHours: 0 });
+    expect(hoursToBlocks(Infinity)).toEqual({ blocks: 0, residualHours: 0 });
+    expect(hoursToBlocks(-Infinity)).toEqual({ blocks: 0, residualHours: 0 });
+  });
 });
 
 describe('blocksToHours', () => {
