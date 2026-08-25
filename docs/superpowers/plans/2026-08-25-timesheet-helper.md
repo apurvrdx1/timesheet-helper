@@ -4,7 +4,7 @@
 
 **Goal:** Build a static web app that turns monthly CAPEX/OPEX hour budgets into optimized weekly timesheets for a manager and their reports, with hand-editable cells that survive recalculation, persisted to a Google Sheet.
 
-**Architecture:** A pure, integer-only domain layer (`src/domain/`) holds the entire optimizer and is tested without a browser. A storage layer (`src/storage/`) talks to a Google Apps Script web app with a localStorage working cache. A thin UI layer (`src/ui/`) renders three pages using Astryx components. The domain layer never imports React; the UI never contains scheduling logic.
+**Architecture:** A pure, integer-only domain layer (`src/domain/`) holds the entire optimizer and is tested without a browser. A storage layer (`src/storage/`) sits behind a `StorageAdapter` interface with three interchangeable backends — Google Sheets, Microsoft 365 Excel, and localStorage only — so the choice of provider never leaks upward. A thin UI layer (`src/ui/`) renders three pages using Astryx components. The domain layer never imports React; the UI never contains scheduling logic.
 
 **Tech Stack:** React 19, TypeScript, Vite, `@astryxdesign/core` + `@astryxdesign/theme-neutral` + `@stylexjs/stylex`, Vitest, React Testing Library, Playwright, GitHub Actions → GitHub Pages, Google Apps Script.
 
@@ -23,6 +23,10 @@
 - No hex colours, raw px, or font sizes in component code — Astryx tokens only, per `DESIGN.md` §5 rule 2.
 - Hours render to exactly one decimal place (`7.5`, `2.0`). Zero renders as an em-dash in disabled colour, never `0.0`.
 - Numeric table columns are right-aligned with `font-variant-numeric: tabular-nums`.
+- No layer above `src/storage/` may reference a specific backend. The UI drives its
+  connection form from `adapter.validate()`, never from a `if (backend === ...)` ladder.
+- Credentials (Google shared secret, Microsoft client id) live in localStorage only.
+  Never compile one into the bundle — GitHub Pages serves the JavaScript publicly.
 - Test coverage target: 80% overall, 95%+ in `src/domain/`.
 - Conventional commits (`feat:`, `fix:`, `test:`, `chore:`, `docs:`). Commit at the end of every task.
 
@@ -33,7 +37,8 @@
 ```
 .github/workflows/deploy.yml     GitHub Pages build + deploy
 apps-script/Code.gs              Pasted into the Sheet, deployed as a web app
-apps-script/README.md            Deployment instructions for the human
+apps-script/README.md            Google backend setup for the human
+docs/microsoft-setup.md          Microsoft 365 backend setup for the human
 
 src/domain/                      PURE — no React, no I/O, no globals
   types.ts                       All domain types and constants
@@ -47,9 +52,14 @@ src/domain/                      PURE — no React, no I/O, no globals
   hash.ts                        Stable input hash for staleness detection
 
 src/storage/
-  serialize.ts                   Model <-> flat tab rows
-  sheetClient.ts                 Apps Script fetch wrapper
-  localCache.ts                  localStorage read/write
+  serialize.ts                   Model <-> flat tab rows (backend-agnostic)
+  adapter.ts                     StorageAdapter interface + BackendConfig
+  registry.ts                    BackendId -> adapter lookup
+  adapters/localOnly.ts          localStorage only, always available
+  adapters/google.ts             Google Sheets via an Apps Script web app
+  adapters/microsoft.ts          Microsoft 365 via MSAL sign-in
+  adapters/graph.ts              Graph Excel REST calls used by the above
+  localCache.ts                  localStorage working cache + saved config
   store.ts                       React state container + sync orchestration
 
 src/ui/
@@ -66,6 +76,7 @@ src/ui/
   components/HourCell.tsx
   components/LeaveDialog.tsx
   components/StaleBanner.tsx
+  components/ConnectionSettings.tsx
   components/PersonWeekView.tsx
   format.ts                      Hour/date formatting shared by UI only
 ```
@@ -76,9 +87,21 @@ Tests are colocated: `src/domain/optimizer.test.ts` next to `src/domain/optimize
 
 # Phase 1 — Foundations
 
-## Task 1: Apps Script spike
+## Task 1: Storage backend spike
 
-Proves the one assumption that could invalidate the whole storage design. **Do this first.** If it fails, stop and report — the fallback is localStorage + JSON export and the plan changes.
+Proves the assumptions that could invalidate the storage design. **Do this first.**
+Both cloud backends have a way of being blocked by someone else's policy, and
+finding out after the app is built is expensive.
+
+- **Google** — a Workspace domain can forbid deploying an Apps Script web app with
+  access set to *Anyone*. A personal Google account cannot.
+- **Microsoft** — a work or school tenant can require an administrator to consent
+  to the app registration before sign-in works. A personal Microsoft account
+  self-consents.
+
+Spike whichever backend the human intends to use first. If both are wanted, spike
+both. If one fails, that backend is unavailable to them — say so plainly and carry
+on; the local-only adapter always works and the other backend may still be fine.
 
 **Files:**
 - Create: `apps-script/Code.gs`
@@ -144,11 +167,22 @@ await (await fetch(URL, {
 
 **STOP if either call fails.** Report the exact error and do not proceed to Task 2.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Spike the Microsoft backend, if wanted**
+
+Only if the human wants the Microsoft 365 backend. Register an SPA app per
+`docs/microsoft-setup.md` (written in full in Task 14), then from the browser
+console on any `https://` origin confirm that a `loginPopup` completes and a
+token comes back with the `Files.ReadWrite` scope.
+
+**A consent error here means a tenant administrator must approve the app.** That
+is not something the code can work around — report it and let the human decide
+whether to pursue approval or use Google instead.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add apps-script/
-git commit -m "feat: apps script web app spike with deployment instructions"
+git commit -m "feat: storage backend spike with deployment instructions"
 ```
 
 ---
@@ -2187,7 +2221,7 @@ Write `src/storage/serialize.ts` exporting the interfaces above. Requirements:
 - Booleans serialize as `TRUE`/`FALSE`; `null` serializes as `''`; numbers via `String(n)`.
 - On read, a row whose length does not match its header pushes a descriptive string onto `problems` and is skipped — never throws, never crashes the app on a hand-edited Sheet.
 - `rowsToModel` accepts a partial payload so a missing tab yields an empty array.
-- Do not serialize `Schedule` or `Meta` here; they are handled in Task 12.
+- Do not serialize `Schedule` or `Meta` here; they are handled in Task 15.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -2203,21 +2237,216 @@ git commit -m "feat: model to sheet row serialization"
 
 ---
 
-## Task 12: Apps Script backend and storage client
+## Task 12: Storage adapter interface and the local-only adapter
+
+Defines the seam both cloud backends implement. Everything above this line —
+the whole domain layer and the whole UI — is backend-agnostic and never learns
+which provider is in use.
+
+**Files:**
+- Create: `src/storage/adapter.ts`, `src/storage/adapters/localOnly.ts`, `src/storage/registry.ts`
+- Test: `src/storage/adapters/localOnly.test.ts`, `src/storage/registry.test.ts`
+
+**Interfaces:**
+- Consumes: `SheetPayload`, `TabName` from `./serialize`
+- Produces:
+  ```ts
+  export type BackendId = 'google' | 'microsoft' | 'local';
+
+  export interface BackendConfig {
+    backend: BackendId;
+    /** Google: the Apps Script /exec URL. Microsoft: the workbook share link. */
+    location: string;
+    /** Google: shared secret. Microsoft: unused (auth is interactive). */
+    secret?: string;
+    /** Microsoft only: Entra app (client) id. */
+    clientId?: string;
+    /** Microsoft only: 'common' | 'consumers' | 'organizations' | a tenant id. */
+    authority?: string;
+  }
+
+  export interface StorageAdapter {
+    readonly id: BackendId;
+    readonly label: string;
+    /** Human-readable check that config is complete. Empty array = ready. */
+    validate(config: BackendConfig): string[];
+    /** Interactive sign-in where the backend needs it. No-op otherwise. */
+    connect(config: BackendConfig): Promise<void>;
+    read(config: BackendConfig): Promise<Partial<SheetPayload>>;
+    write(config: BackendConfig, payload: SheetPayload): Promise<void>;
+    disconnect(): Promise<void>;
+  }
+
+  export function getAdapter(id: BackendId): StorageAdapter;
+  export function listAdapters(): StorageAdapter[];
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// src/storage/registry.test.ts
+import { describe, it, expect } from 'vitest';
+import { getAdapter, listAdapters } from './registry';
+
+describe('registry', () => {
+  it('offers all three backends', () => {
+    expect(listAdapters().map((a) => a.id).sort())
+      .toEqual(['google', 'local', 'microsoft']);
+  });
+
+  it('gives every backend a human label', () => {
+    for (const adapter of listAdapters()) {
+      expect(adapter.label.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('resolves an adapter by id', () => {
+    expect(getAdapter('google').id).toBe('google');
+    expect(getAdapter('microsoft').id).toBe('microsoft');
+  });
+
+  it('throws on an unknown id rather than returning undefined', () => {
+    expect(() => getAdapter('dropbox' as never)).toThrow(/unknown/i);
+  });
+
+  it('exposes the identical shape for every backend', () => {
+    for (const adapter of listAdapters()) {
+      expect(typeof adapter.validate).toBe('function');
+      expect(typeof adapter.connect).toBe('function');
+      expect(typeof adapter.read).toBe('function');
+      expect(typeof adapter.write).toBe('function');
+      expect(typeof adapter.disconnect).toBe('function');
+    }
+  });
+});
+```
+
+```ts
+// src/storage/adapters/localOnly.test.ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import { localOnlyAdapter } from './localOnly';
+
+const config = { backend: 'local' as const, location: '' };
+
+beforeEach(() => { localStorage.clear(); });
+
+describe('localOnlyAdapter', () => {
+  it('needs no configuration', () => {
+    expect(localOnlyAdapter.validate(config)).toEqual([]);
+  });
+
+  it('round-trips a payload', async () => {
+    const payload = { OTLs: [['projectCode'], ['P-1001']] } as never;
+    await localOnlyAdapter.write(config, payload);
+    expect(await localOnlyAdapter.read(config)).toEqual(payload);
+  });
+
+  it('returns an empty payload before anything is written', async () => {
+    expect(await localOnlyAdapter.read(config)).toEqual({});
+  });
+
+  it('survives a throwing storage accessor', async () => {
+    const original = Storage.prototype.getItem;
+    Storage.prototype.getItem = () => { throw new Error('blocked'); };
+    await expect(localOnlyAdapter.read(config)).resolves.toEqual({});
+    Storage.prototype.getItem = original;
+  });
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npx vitest run src/storage/registry.test.ts src/storage/adapters/localOnly.test.ts`
+Expected: FAIL — cannot resolve `./registry`
+
+- [ ] **Step 3: Implement**
+
+```ts
+// src/storage/adapter.ts
+import type { SheetPayload } from './serialize';
+
+export type BackendId = 'google' | 'microsoft' | 'local';
+
+export interface BackendConfig {
+  backend: BackendId;
+  location: string;
+  secret?: string;
+  clientId?: string;
+  authority?: string;
+}
+
+export interface StorageAdapter {
+  readonly id: BackendId;
+  readonly label: string;
+  validate(config: BackendConfig): string[];
+  connect(config: BackendConfig): Promise<void>;
+  read(config: BackendConfig): Promise<Partial<SheetPayload>>;
+  write(config: BackendConfig, payload: SheetPayload): Promise<void>;
+  disconnect(): Promise<void>;
+}
+```
+
+```ts
+// src/storage/adapters/localOnly.ts
+import type { StorageAdapter } from '../adapter';
+import type { SheetPayload } from '../serialize';
+
+const KEY = 'timesheet-helper:payload:v1';
+
+/** The always-available fallback. No account, no network, this browser only. */
+export const localOnlyAdapter: StorageAdapter = {
+  id: 'local',
+  label: 'This browser only',
+  validate: () => [],
+  connect: async () => {},
+  disconnect: async () => {},
+
+  async read() {
+    try {
+      const raw = localStorage.getItem(KEY);
+      return raw ? (JSON.parse(raw) as Partial<SheetPayload>) : {};
+    } catch {
+      return {};   // private browsing, blocked site data, corrupt JSON
+    }
+  },
+
+  async write(_config, payload) {
+    try {
+      localStorage.setItem(KEY, JSON.stringify(payload));
+    } catch {
+      throw new Error('This browser refused to save. Export a backup instead.');
+    }
+  },
+};
+```
+
+`registry.ts` maps each `BackendId` to its adapter and throws `new Error(\`Unknown storage backend: ${id}\`)` for anything else. Import the Google and Microsoft adapters from Tasks 13 and 14 — write the registry last, or stub those two imports and fill them in as each lands.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npx vitest run src/storage/registry.test.ts src/storage/adapters/localOnly.test.ts`
+Expected: PASS, 9 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/storage/adapter.ts src/storage/registry.ts src/storage/adapters/
+git commit -m "feat: pluggable storage adapter interface with local-only backend"
+```
+
+---
+
+## Task 13: Google Sheets adapter
 
 **Files:**
 - Modify: `apps-script/Code.gs` (replace the Task 1 spike entirely)
-- Create: `src/storage/sheetClient.ts`, `src/storage/localCache.ts`, `src/storage/store.ts`
-- Test: `src/storage/sheetClient.test.ts`, `src/storage/localCache.test.ts`
+- Modify: `apps-script/README.md`
+- Create: `src/storage/adapters/google.ts`
+- Test: `src/storage/adapters/google.test.ts`
 
 **Interfaces:**
-- Consumes: `modelToRows`, `rowsToModel` from `./serialize`; `hashModel` from `../domain/hash`
-- Produces:
-  `readAll(url: string, secret: string): Promise<Partial<SheetPayload>>`,
-  `writeAll(url: string, secret: string, payload: SheetPayload): Promise<void>`,
-  `loadCache(): { model: Model; hash: string } | null`,
-  `saveCache(model: Model, hash: string): void`,
-  `useStore()` React hook exposing `{ model, result, isStale, sync, recalculate, update }`
+- Consumes: `StorageAdapter`, `BackendConfig` from `../adapter`
+- Produces: `googleAdapter: StorageAdapter`
 
 - [ ] **Step 1: Write the full Apps Script**
 
@@ -2267,31 +2496,54 @@ function doPost(e) {
 }
 ```
 
-Update `apps-script/README.md`: the human must replace `SECRET` with their own string and redeploy (**Deploy → Manage deployments → Edit → New version**; editing the script alone does not update the live URL).
+Update `apps-script/README.md`: the human replaces `SECRET` with their own string and redeploys via **Deploy → Manage deployments → Edit → New version**. Editing the script alone does not update the live URL — this catches people out every time.
 
-- [ ] **Step 2: Write the failing client test**
+- [ ] **Step 2: Write the failing test**
 
 ```ts
-// src/storage/sheetClient.test.ts
+// src/storage/adapters/google.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readAll, writeAll } from './sheetClient';
+import { googleAdapter } from './google';
 
-const URL = 'https://script.google.com/macros/s/abc/exec';
+const config = {
+  backend: 'google' as const,
+  location: 'https://script.google.com/macros/s/abc/exec',
+  secret: 'hunter2',
+};
 
 beforeEach(() => { vi.restoreAllMocks(); });
 
-describe('readAll', () => {
+describe('googleAdapter.validate', () => {
+  it('accepts a complete config', () => {
+    expect(googleAdapter.validate(config)).toEqual([]);
+  });
+
+  it('rejects a missing URL', () => {
+    expect(googleAdapter.validate({ ...config, location: '' })).toHaveLength(1);
+  });
+
+  it('rejects a missing secret', () => {
+    expect(googleAdapter.validate({ ...config, secret: '' })).toHaveLength(1);
+  });
+
+  it('rejects a URL that is not an Apps Script exec endpoint', () => {
+    expect(googleAdapter.validate({ ...config, location: 'https://example.com' }))
+      .toHaveLength(1);
+  });
+});
+
+describe('googleAdapter.read', () => {
   it('returns the payload on success', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true, json: async () => ({ ok: true, payload: { OTLs: [['projectCode']] } }),
     }));
-    expect(await readAll(URL, 's')).toEqual({ OTLs: [['projectCode']] });
+    expect(await googleAdapter.read(config)).toEqual({ OTLs: [['projectCode']] });
   });
 
   it('passes the secret as a query parameter', async () => {
     const spy = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, payload: {} }) });
     vi.stubGlobal('fetch', spy);
-    await readAll(URL, 'hunter2');
+    await googleAdapter.read(config);
     expect(spy.mock.calls[0][0]).toContain('secret=hunter2');
   });
 
@@ -2299,46 +2551,466 @@ describe('readAll', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true, json: async () => ({ ok: false, error: 'unauthorized' }),
     }));
-    await expect(readAll(URL, 'wrong')).rejects.toThrow('unauthorized');
+    await expect(googleAdapter.read(config)).rejects.toThrow(/unauthorized/);
+  });
+
+  it('reports a network failure without leaking the raw error', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+    await expect(googleAdapter.read(config)).rejects.toThrow(/could not reach/i);
   });
 });
 
-describe('writeAll', () => {
+describe('googleAdapter.write', () => {
   it('posts as text/plain to avoid a CORS preflight', async () => {
     const spy = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
     vi.stubGlobal('fetch', spy);
-    await writeAll(URL, 's', { OTLs: [['projectCode']] } as never);
-    expect(spy.mock.calls[0][1].headers['Content-Type']).toContain('text/plain');
+    await googleAdapter.write(config, { OTLs: [['projectCode']] } as never);
     expect(spy.mock.calls[0][1].method).toBe('POST');
+    expect(spy.mock.calls[0][1].headers['Content-Type']).toContain('text/plain');
+  });
+
+  it('sends the secret in the body, never the URL', async () => {
+    const spy = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', spy);
+    await googleAdapter.write(config, { OTLs: [] } as never);
+    expect(spy.mock.calls[0][0]).not.toContain('hunter2');
+    expect(JSON.parse(spy.mock.calls[0][1].body).secret).toBe('hunter2');
   });
 });
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `npx vitest run src/storage/sheetClient.test.ts`
-Expected: FAIL — cannot resolve `./sheetClient`
+Run: `npx vitest run src/storage/adapters/google.test.ts`
+Expected: FAIL — cannot resolve `./google`
 
-- [ ] **Step 4: Implement the client, cache and store**
+- [ ] **Step 4: Implement**
 
-`sheetClient.ts` — `readAll` issues `GET ${url}?secret=${encodeURIComponent(secret)}`; `writeAll` issues a POST with `Content-Type: text/plain;charset=utf-8` and body `JSON.stringify({ secret, payload })`. Both throw `new Error(body.error)` when `ok` is false.
+`read` issues `GET ${location}?secret=${encodeURIComponent(secret)}`. `write` issues a POST with `Content-Type: text/plain;charset=utf-8` — `application/json` triggers a CORS preflight Apps Script does not answer — and body `JSON.stringify({ secret, payload })`. Both throw `new Error(body.error)` when `ok` is false, and wrap a rejected fetch as `new Error('Could not reach the Apps Script endpoint. Check the URL and that the deployment is set to "Anyone".')`. `validate` requires a non-empty secret and a location matching `/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/`. `connect` and `disconnect` are no-ops — this backend has no interactive session.
 
-`localCache.ts` — key `timesheet-helper:v1`, storing `{ model, hash }`. Every read is wrapped in try/catch and returns `null` on parse failure or a throwing accessor (private browsing, blocked site data).
+- [ ] **Step 5: Run test to verify it passes**
 
-`store.ts` — a `useStore()` hook holding `model`, the computed `ScheduleResult`, `lastCalculatedHash`, and `isStale = hashModel(model) !== lastCalculatedHash`. `update(fn)` applies an immutable change, writes the cache, and pushes to the Sheet debounced at 2s. `recalculate()` runs `scheduleAll`, stores the new hash, and writes the `Schedule` tab. On mount: try the Sheet, fall back to the cache, and surface a non-blocking notice if the Sheet is unreachable.
-
-**All state updates are immutable** — build new objects, never mutate `model` in place.
-
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `npx vitest run src/storage`
-Expected: PASS
+Run: `npx vitest run src/storage/adapters/google.test.ts`
+Expected: PASS, 10 tests
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add apps-script/ src/storage/
-git commit -m "feat: apps script backend, sheet client, cache and store"
+git add apps-script/ src/storage/adapters/google.ts src/storage/adapters/google.test.ts
+git commit -m "feat: google sheets storage adapter via apps script"
+```
+
+---
+
+## Task 14: Microsoft 365 Excel adapter
+
+Uses MSAL browser auth (PKCE, public client — no client secret, which a static site could not keep anyway) and the Graph Excel API. The user signs in with Microsoft and the app reads the workbook as them.
+
+**Files:**
+- Create: `src/storage/adapters/microsoft.ts`, `src/storage/adapters/graph.ts`
+- Create: `docs/microsoft-setup.md`
+- Test: `src/storage/adapters/microsoft.test.ts`, `src/storage/adapters/graph.test.ts`
+
+**Interfaces:**
+- Consumes: `StorageAdapter`, `BackendConfig` from `../adapter`
+- Produces:
+  `microsoftAdapter: StorageAdapter`,
+  `encodeShareUrl(url: string): string`,
+  `resolveWorkbookId(token: string, shareUrl: string): Promise<string>`,
+  `readWorksheet(token: string, itemId: string, name: string): Promise<string[][]>`,
+  `writeWorksheet(token: string, itemId: string, name: string, rows: string[][]): Promise<void>`
+
+- [ ] **Step 1: Install MSAL**
+
+```bash
+npm install @azure/msal-browser
+```
+
+- [ ] **Step 2: Write the setup guide**
+
+```markdown
+<!-- docs/microsoft-setup.md -->
+# Microsoft 365 setup
+
+1. Go to the Microsoft Entra admin centre -> App registrations -> New registration.
+   - Name: Timesheet Helper
+   - Supported account types: pick to match your workbook's account.
+     Personal OneDrive -> "Personal Microsoft accounts only".
+     Work/school -> "Accounts in this organizational directory only".
+   - Redirect URI: **Single-page application (SPA)**, set to your Pages URL,
+     e.g. `https://<user>.github.io/timesheet-helper/`.
+     It MUST be registered as SPA, not Web — a Web redirect URI rejects
+     the PKCE flow a static page uses.
+2. Copy the **Application (client) ID**. This is `clientId` in the app.
+3. API permissions -> Microsoft Graph -> Delegated -> `Files.ReadWrite`,
+   `User.Read`. Grant consent.
+   **If this is a work or school account, an administrator may have to
+   approve this before sign-in will work.** Personal accounts self-consent.
+4. Create an empty `.xlsx` workbook in OneDrive or SharePoint. Copy its
+   sharing link. This is `location` in the app.
+5. Authority: `consumers` for a personal account, your tenant id for a
+   work account, or `common` to accept both.
+```
+
+- [ ] **Step 3: Write the failing Graph test**
+
+```ts
+// src/storage/adapters/graph.test.ts
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { encodeShareUrl, resolveWorkbookId, readWorksheet, writeWorksheet } from './graph';
+
+beforeEach(() => { vi.restoreAllMocks(); });
+
+describe('encodeShareUrl', () => {
+  it('produces a base64url token prefixed with u!', () => {
+    const got = encodeShareUrl('https://contoso-my.sharepoint.com/x.xlsx');
+    expect(got.startsWith('u!')).toBe(true);
+    expect(got).not.toContain('=');   // padding stripped
+    expect(got).not.toContain('+');   // base64url, not base64
+    expect(got).not.toContain('/');
+  });
+});
+
+describe('resolveWorkbookId', () => {
+  it('turns a share link into a drive item id', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ id: 'ITEM123' }),
+    }));
+    expect(await resolveWorkbookId('tok', 'https://x/y.xlsx')).toBe('ITEM123');
+  });
+
+  it('explains a 404 in terms the user can act on', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 404, text: async () => 'not found',
+    }));
+    await expect(resolveWorkbookId('tok', 'https://x/y.xlsx'))
+      .rejects.toThrow(/could not find that workbook/i);
+  });
+});
+
+describe('readWorksheet', () => {
+  it('returns the used range values', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ text: [['projectCode'], ['P-1001']] }),
+    }));
+    expect(await readWorksheet('tok', 'ITEM123', 'OTLs'))
+      .toEqual([['projectCode'], ['P-1001']]);
+  });
+
+  it('returns an empty grid when the worksheet does not exist yet', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 404, text: async () => 'ItemNotFound',
+    }));
+    expect(await readWorksheet('tok', 'ITEM123', 'Missing')).toEqual([]);
+  });
+
+  it('requests the worksheet by name, url-encoded', async () => {
+    const spy = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ text: [] }) });
+    vi.stubGlobal('fetch', spy);
+    await readWorksheet('tok', 'ITEM123', 'Stat Holidays');
+    expect(spy.mock.calls[0][0]).toContain("worksheets('Stat%20Holidays')");
+  });
+});
+
+describe('writeWorksheet', () => {
+  it('clears the sheet before writing so stale rows cannot survive', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+      calls.push(url);
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    }));
+    await writeWorksheet('tok', 'ITEM123', 'OTLs', [['a'], ['b']]);
+    expect(calls.some((c) => c.includes('clear'))).toBe(true);
+  });
+
+  it('addresses the range by exact dimensions', async () => {
+    const bodies: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.body) bodies.push(String(init.body));
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    }));
+    // 2 rows x 3 columns -> A1:C2
+    await writeWorksheet('tok', 'ITEM123', 'OTLs', [['a','b','c'], ['d','e','f']]);
+    expect(bodies.some((b) => b.includes('"values"'))).toBe(true);
+  });
+
+  it('does nothing but clear when given no rows', async () => {
+    const spy = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal('fetch', spy);
+    await writeWorksheet('tok', 'ITEM123', 'OTLs', []);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+- [ ] **Step 4: Run test to verify it fails**
+
+Run: `npx vitest run src/storage/adapters/graph.test.ts`
+Expected: FAIL — cannot resolve `./graph`
+
+- [ ] **Step 5: Implement the Graph layer**
+
+```ts
+// src/storage/adapters/graph.ts
+const GRAPH = 'https://graph.microsoft.com/v1.0';
+
+/** Graph addresses a shared file by a base64url token of its sharing URL. */
+export function encodeShareUrl(url: string): string {
+  const b64 = btoa(url);
+  return 'u!' + b64.replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+async function call(
+  token: string, path: string, init: RequestInit = {},
+): Promise<Response> {
+  return fetch(`${GRAPH}${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+export async function resolveWorkbookId(token: string, shareUrl: string): Promise<string> {
+  const res = await call(token, `/shares/${encodeShareUrl(shareUrl)}/driveItem`);
+  if (!res.ok) {
+    throw new Error(
+      'Could not find that workbook. Check the sharing link, and that the ' +
+      'signed-in account has access to it.');
+  }
+  return (await res.json()).id as string;
+}
+
+/** Used-range values as display text. An absent worksheet reads as empty. */
+export async function readWorksheet(
+  token: string, itemId: string, name: string,
+): Promise<string[][]> {
+  const sheet = encodeURIComponent(name);
+  const res = await call(token,
+    `/me/drive/items/${itemId}/workbook/worksheets('${sheet}')/usedRange(valuesOnly=true)`);
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`Could not read the "${name}" sheet.`);
+  const body = await res.json();
+  return (body.text ?? body.values ?? []) as string[][];
+}
+
+function columnName(n: number): string {
+  let out = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    out = String.fromCharCode(65 + rem) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
+}
+
+export async function writeWorksheet(
+  token: string, itemId: string, name: string, rows: string[][],
+): Promise<void> {
+  const sheet = encodeURIComponent(name);
+  const base = `/me/drive/items/${itemId}/workbook/worksheets('${sheet}')`;
+
+  // Create on demand — a fresh workbook has none of our sheets.
+  const clear = await call(token, `${base}/usedRange/clear`, {
+    method: 'POST', body: JSON.stringify({ applyTo: 'contents' }),
+  });
+  if (clear.status === 404) {
+    await call(token, `/me/drive/items/${itemId}/workbook/worksheets`, {
+      method: 'POST', body: JSON.stringify({ name }),
+    });
+  }
+  if (rows.length === 0) return;
+
+  const address = `A1:${columnName(rows[0].length)}${rows.length}`;
+  const res = await call(token, `${base}/range(address='${address}')`, {
+    method: 'PATCH', body: JSON.stringify({ values: rows }),
+  });
+  if (!res.ok) throw new Error(`Could not write the "${name}" sheet.`);
+}
+```
+
+- [ ] **Step 6: Run test to verify it passes**
+
+Run: `npx vitest run src/storage/adapters/graph.test.ts`
+Expected: PASS, 9 tests
+
+- [ ] **Step 7: Write the failing adapter test**
+
+```ts
+// src/storage/adapters/microsoft.test.ts
+import { describe, it, expect } from 'vitest';
+import { microsoftAdapter } from './microsoft';
+
+const config = {
+  backend: 'microsoft' as const,
+  location: 'https://contoso-my.sharepoint.com/personal/x/Doc.aspx?sourcedoc=1',
+  clientId: '11111111-2222-3333-4444-555555555555',
+  authority: 'consumers',
+};
+
+describe('microsoftAdapter.validate', () => {
+  it('accepts a complete config', () => {
+    expect(microsoftAdapter.validate(config)).toEqual([]);
+  });
+
+  it('requires a client id', () => {
+    expect(microsoftAdapter.validate({ ...config, clientId: '' })).toHaveLength(1);
+  });
+
+  it('rejects a client id that is not a GUID', () => {
+    expect(microsoftAdapter.validate({ ...config, clientId: 'not-a-guid' }))
+      .toHaveLength(1);
+  });
+
+  it('requires a workbook link', () => {
+    expect(microsoftAdapter.validate({ ...config, location: '' })).toHaveLength(1);
+  });
+
+  it('defaults the authority when it is absent', () => {
+    expect(microsoftAdapter.validate({ ...config, authority: undefined })).toEqual([]);
+  });
+
+  it('never asks for a shared secret', () => {
+    const problems = microsoftAdapter.validate({ ...config, secret: undefined });
+    expect(problems.join(' ')).not.toMatch(/secret/i);
+  });
+});
+```
+
+- [ ] **Step 8: Run test to verify it fails**
+
+Run: `npx vitest run src/storage/adapters/microsoft.test.ts`
+Expected: FAIL — cannot resolve `./microsoft`
+
+- [ ] **Step 9: Implement the adapter**
+
+Hold a lazily-constructed `PublicClientApplication` keyed on `clientId` + `authority`. `connect` calls `initialize()`, then `acquireTokenSilent` falling back to `loginPopup` with scopes `['Files.ReadWrite', 'User.Read']`. Cache the resolved workbook item id per `location` so `read` and `write` do not re-resolve the share link on every call. `read` maps over the eight tab names via `readWorksheet`; `write` iterates `writeWorksheet`. `disconnect` calls `logoutPopup` and clears the cached id. `validate` requires a GUID `clientId` and a non-empty `location`, defaulting `authority` to `common`. Surface a consent failure as: *"Microsoft refused the sign-in. If this is a work or school account, an administrator may need to approve the app first."*
+
+`msalConfig.auth.redirectUri` must be `window.location.origin + import.meta.env.BASE_URL` so it matches the registered SPA URI on Pages.
+
+- [ ] **Step 10: Run test to verify it passes**
+
+Run: `npx vitest run src/storage/adapters/microsoft.test.ts`
+Expected: PASS, 6 tests
+
+- [ ] **Step 11: Wire the registry and commit**
+
+Fill in the real imports in `registry.ts`, then:
+
+```bash
+npx vitest run src/storage
+git add src/storage/ docs/microsoft-setup.md package.json package-lock.json
+git commit -m "feat: microsoft 365 excel storage adapter via msal and graph"
+```
+
+---
+
+## Task 15: Store, sync and the connection settings UI
+
+**Files:**
+- Create: `src/storage/localCache.ts`, `src/storage/store.ts`, `src/ui/components/ConnectionSettings.tsx`
+- Test: `src/storage/localCache.test.ts`, `src/ui/components/ConnectionSettings.test.tsx`
+
+**Interfaces:**
+- Consumes: `getAdapter`, `listAdapters` from `../storage/registry`; `modelToRows`, `rowsToModel` from `./serialize`; `hashModel` from `../domain/hash`; `scheduleAll` from `../domain/schedule`
+- Produces:
+  `loadCache(): { model: Model; hash: string; config: BackendConfig } | null`,
+  `saveCache(model: Model, hash: string, config: BackendConfig): void`,
+  `useStore()` exposing `{ model, result, config, isStale, status, update, recalculate, connect, disconnect }`
+
+- [ ] **Step 1: Write the failing settings test**
+
+```tsx
+// src/ui/components/ConnectionSettings.test.tsx
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { ConnectionSettings } from './ConnectionSettings';
+
+const google = { backend: 'google' as const, location: '', secret: '' };
+
+describe('ConnectionSettings', () => {
+  it('offers all three backends', () => {
+    render(<ConnectionSettings config={google} onChange={vi.fn()} onConnect={vi.fn()} />);
+    expect(screen.getByRole('option', { name: /google/i })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /microsoft/i })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /this browser/i })).toBeInTheDocument();
+  });
+
+  it('asks for a script URL and secret for Google', () => {
+    render(<ConnectionSettings config={google} onChange={vi.fn()} onConnect={vi.fn()} />);
+    expect(screen.getByLabelText(/script url/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/shared secret/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/client id/i)).not.toBeInTheDocument();
+  });
+
+  it('asks for a client id and workbook link for Microsoft', () => {
+    render(<ConnectionSettings
+      config={{ backend: 'microsoft', location: '' }}
+      onChange={vi.fn()} onConnect={vi.fn()} />);
+    expect(screen.getByLabelText(/client id/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/workbook link/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/shared secret/i)).not.toBeInTheDocument();
+  });
+
+  it('asks for nothing at all for local-only', () => {
+    render(<ConnectionSettings
+      config={{ backend: 'local', location: '' }}
+      onChange={vi.fn()} onConnect={vi.fn()} />);
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+  });
+
+  it('surfaces validation problems and blocks connecting', async () => {
+    const onConnect = vi.fn();
+    render(<ConnectionSettings config={google} onChange={vi.fn()} onConnect={onConnect} />);
+    await userEvent.click(screen.getByRole('button', { name: /connect/i }));
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+  });
+
+  it('warns that a work account may need admin approval', async () => {
+    render(<ConnectionSettings
+      config={{ backend: 'microsoft', location: '' }}
+      onChange={vi.fn()} onConnect={vi.fn()} />);
+    expect(screen.getByText(/administrator/i)).toBeInTheDocument();
+  });
+
+  it('never renders the secret in a readable field', () => {
+    render(<ConnectionSettings
+      config={{ ...google, secret: 'hunter2' }}
+      onChange={vi.fn()} onConnect={vi.fn()} />);
+    expect(screen.getByLabelText(/shared secret/i)).toHaveAttribute('type', 'password');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run src/ui/components/ConnectionSettings.test.tsx`
+Expected: FAIL — cannot resolve `./ConnectionSettings`
+
+- [ ] **Step 3: Implement**
+
+`ConnectionSettings` is an Astryx `Dialog` with a backend `Selector` and **only the fields the chosen adapter needs** — the whole point of the adapter seam is that this form is driven by `adapter.validate`, never by a hardcoded `if (backend === 'google')` ladder in the UI. Problems from `validate` render in a `Banner` with `role="alert"` and block Connect. The Microsoft branch shows the admin-consent caveat inline and links `docs/microsoft-setup.md`; the Google branch links `apps-script/README.md`.
+
+`localCache.ts` — key `timesheet-helper:v1`, storing `{ model, hash, config }`. The **secret and clientId are stored here and never compiled into the bundle**; GitHub Pages serves the JavaScript publicly. Every read is wrapped in try/catch returning `null`.
+
+`store.ts` — `useStore()` holds `model`, `result`, `config`, `lastCalculatedHash`, and `status: 'idle' | 'syncing' | 'offline' | 'error'`. `isStale = hashModel(model) !== lastCalculatedHash`. `update(fn)` applies an **immutable** change, writes the cache, and pushes to the active adapter debounced at 2s. `recalculate()` runs `scheduleAll`, stores the new hash, and writes the `Schedule` tab. On mount: read through the configured adapter, fall back to the cache with a non-blocking notice on failure, and open `ConnectionSettings` when no backend is configured yet.
+
+Switching backends must **not** lose data: on change, keep the in-memory model and offer to write it to the newly selected backend.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npx vitest run src/storage src/ui/components/ConnectionSettings.test.tsx`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/storage/ src/ui/components/ConnectionSettings.tsx src/ui/components/ConnectionSettings.test.tsx
+git commit -m "feat: store, sync and backend connection settings"
 ```
 
 ---
@@ -2347,7 +3019,7 @@ git commit -m "feat: apps script backend, sheet client, cache and store"
 
 **Before every task in this phase:** read `./DESIGN.md`. It is authoritative. Reach for the Astryx component before writing any custom CSS.
 
-## Task 13: App shell and navigation
+## Task 16: App shell and navigation
 
 **Files:**
 - Modify: `src/ui/App.tsx`
@@ -2418,7 +3090,7 @@ git commit -m "feat: app shell, nav tabs and stale banner"
 
 ---
 
-## Task 14: Setup page
+## Task 17: Setup page
 
 **Files:**
 - Create: `src/ui/pages/SetupPage.tsx`, `src/ui/components/OtlTable.tsx`, `src/ui/components/PeopleTree.tsx`, `src/ui/components/StatHolidayList.tsx`
@@ -2516,7 +3188,7 @@ git commit -m "feat: setup page for otls, people and stat holidays"
 
 ---
 
-## Task 15: Allocations page
+## Task 18: Allocations page
 
 **Files:**
 - Create: `src/ui/pages/AllocationsPage.tsx`, `src/ui/components/AllocationGrid.tsx`
@@ -2618,7 +3290,7 @@ git commit -m "feat: monthly allocations grid with capacity and unassigned warni
 
 ---
 
-## Task 16: Weeks page
+## Task 19: Weeks page
 
 The main view: accordion, editable cells, overrides, leave.
 
@@ -2809,7 +3481,7 @@ git commit -m "feat: weeks page with accordion, editable cells, overrides and le
 
 ---
 
-## Task 17: Per-person weekly read-off view
+## Task 20: Per-person weekly read-off view
 
 **Files:**
 - Create: `src/ui/components/PersonWeekView.tsx`
@@ -2879,7 +3551,7 @@ git commit -m "feat: per-person weekly read-off view"
 
 # Phase 5 — Verification and release
 
-## Task 18: End-to-end journey, audit and deploy
+## Task 21: End-to-end journey, audit and deploy
 
 **Files:**
 - Create: `playwright.config.ts`, `e2e/journey.spec.ts`
@@ -2997,8 +3669,29 @@ Confirm the Actions run is green and the live Pages URL works: enter the secret,
 
 ## Self-Review
 
-**Spec coverage.** §3.1 capacity → Tasks 3, 5. §3.2 entities → Tasks 3, 14. §3.3 floor → Task 5. §3.4 weeks and months → Tasks 4, 7. §3.5 allocations → Tasks 6, 15. §3.6 leftovers → Task 8. §3.7 leave → Tasks 5, 16. §3.8 overrides → Tasks 7, 16. §4 optimizer and invariants → Tasks 7, 8, 9. §5 data model → Tasks 3, 11. §6 storage and staleness → Tasks 1, 10, 12. §7 UI → Tasks 13–17. §8 technology → Task 2. §9 testing → throughout, plus Task 18. §10 build order → task order. §11 risks → Task 1 spike, Task 12 fallback.
+**Spec coverage.** §3.1 capacity → Tasks 3, 5. §3.2 entities → Tasks 3, 17. §3.3 floor
+→ Task 5. §3.4 weeks and months → Tasks 4, 7. §3.5 allocations → Tasks 6, 18. §3.6
+leftovers → Task 8. §3.7 leave → Tasks 5, 19. §3.8 overrides → Tasks 7, 19. §4 optimizer
+and invariants → Tasks 7, 8, 9. §5 data model → Tasks 3, 11. §6 storage and staleness →
+Tasks 1, 10, 12–15. §7 UI → Tasks 16–20. §8 technology → Task 2. §9 testing → throughout,
+plus Task 21. §10 build order → task order. §11 risks → Task 1 spike, Task 12 local-only
+fallback.
 
-**Placeholder scan.** No TBDs. Tasks 11, 12, 14, 15, 16 and 17 state implementation requirements in prose rather than full component source, because the exact Astryx component APIs must be read from the live docs and `npx astryx` CLI at implementation time; each is pinned by a complete failing test that defines the contract precisely.
+**Amendment (pluggable backends).** The spec was written against a single Google Sheets
+backend. Tasks 12–15 generalise this to a `StorageAdapter` interface with Google,
+Microsoft 365 and local-only implementations. Nothing in Tasks 3–11 or 16–21 changes —
+the domain layer and UI never learn which backend is active. Spec §6 has been updated to
+match.
 
-**Type consistency.** `Blocks`, `IsoDate`, `IsoMonth`, `OtlCode`, `PersonId` defined once in Task 3 and used unchanged throughout. `keyOf(month, otl)` defined in Task 6, used in Tasks 7 and 8. `scheduleWeek` signature fixed in Task 7 and consumed unchanged in Task 8. `ScheduleResult` defined in Task 3, produced in Task 8, consumed in Tasks 9, 12 and 16.
+**Placeholder scan.** No TBDs. Tasks 11, 14 (adapter half), 15, 17, 18, 19 and 20 state
+implementation requirements in prose rather than full component source, because the exact
+Astryx and MSAL APIs must be read from live docs at implementation time; each is pinned by
+a complete failing test that defines the contract precisely.
+
+**Type consistency.** `Blocks`, `IsoDate`, `IsoMonth`, `OtlCode`, `PersonId` defined once
+in Task 3 and used unchanged throughout. `keyOf(month, otl)` defined in Task 6, used in
+Tasks 7 and 8. `scheduleWeek` signature fixed in Task 7, consumed unchanged in Task 8.
+`ScheduleResult` defined in Task 3, produced in Task 8, consumed in Tasks 9, 15 and 19.
+`StorageAdapter` and `BackendConfig` defined in Task 12, implemented identically in Tasks
+12, 13 and 14, consumed in Task 15. `SheetPayload` defined in Task 11 and is the only type
+crossing the storage boundary.

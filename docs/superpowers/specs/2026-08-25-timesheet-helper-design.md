@@ -163,18 +163,54 @@ user-owned and never written by the optimizer.
 
 ## 6. Storage and sync
 
-- **Durable store:** a Google Sheet on a personal Google account, reached through an Apps
-  Script web app deployed with access set to *Anyone*. The script exposes `doGet` (read all
-  tabs) and `doPost` (write a tab), exchanging JSON.
-- **Requests use `Content-Type: text/plain`** to avoid a CORS preflight, which Apps Script
-  handles poorly.
+Persistence sits behind a **`StorageAdapter`** interface with three interchangeable
+backends. Nothing above the storage layer knows which one is active; the connection form
+is driven by each adapter's own `validate()`, not by conditionals in the UI.
+
+### 6.1 Google Sheets
+
+A Google Sheet reached through an Apps Script web app deployed with access set to
+*Anyone*. The script exposes `doGet` (read all tabs) and `doPost` (write tabs), exchanging
+JSON, and takes a document lock so two tabs cannot interleave mid-write.
+
+Requests use `Content-Type: text/plain` to avoid a CORS preflight, which Apps Script
+handles poorly. A **shared secret** guards the endpoint. The app prompts for it once and
+keeps it in localStorage — deliberately *not* compiled into the bundle, since GitHub Pages
+serves the JavaScript publicly and a baked-in secret would protect nothing.
+
+*Constraint:* a Workspace domain may forbid *Anyone* deployments. Personal accounts do not.
+
+### 6.2 Microsoft 365 Excel
+
+A workbook in OneDrive or SharePoint, reached through the **Microsoft Graph Excel API**
+with **MSAL browser authentication** (PKCE public client — a static site cannot keep a
+client secret). The user signs in with Microsoft and the app reads the workbook as them,
+so access is governed by the workbook's own sharing rather than by a shared secret.
+
+Setup requires an Entra app registration whose redirect URI is registered as
+**Single-page application**, not Web; a Web redirect rejects the PKCE flow. Scopes are
+`Files.ReadWrite` and `User.Read`. A sharing link is resolved to a drive item via
+`/shares/{token}/driveItem`; each tab is a worksheet read through
+`usedRange(valuesOnly=true)` and written by clearing then `PATCH`ing an addressed range.
+
+*Constraint:* a work or school tenant may require administrator consent before sign-in
+succeeds. Personal Microsoft accounts self-consent. This is a policy decision the code
+cannot route around, so the app reports it in those terms.
+
+### 6.3 Local only
+
+localStorage with JSON export and import. Always available, needs no account, and is the
+documented fallback when either cloud backend is blocked. Single browser, single machine.
+
+### 6.4 Common behaviour
+
 - **Working cache:** localStorage, written on every edit, so a refresh never loses work.
-  Load prefers the Sheet and falls back to the cache when offline.
-- **Shared secret:** the app prompts for it once and stores it in localStorage. It is
-  deliberately *not* compiled into the bundle, since GitHub Pages serves the JavaScript
-  publicly and a baked-in secret would protect nothing.
-- **Fallback:** if the deployment is rejected or unreachable, the app runs on localStorage
-  alone with JSON export/import. This must degrade cleanly, not crash.
+  Load prefers the configured backend and falls back to the cache when it is unreachable,
+  with a non-blocking notice rather than a crash.
+- **Switching backends** must not lose data: the in-memory model is retained and offered
+  to the newly selected backend.
+- **Tab layout is identical across backends** — the same eight named tabs with the same
+  columns, so a workbook and a Sheet hold interchangeable data.
 
 ### Staleness detection
 
@@ -211,6 +247,8 @@ timesheet system.
 - React 19, TypeScript, Vite.
 - `@astryxdesign/core`, `@astryxdesign/theme-neutral`, `@stylexjs/stylex`,
   `@astryxdesign/cli` (dev). Astryx ships pre-built CSS, so no build plugin is needed.
+- `@azure/msal-browser` for the Microsoft backend only; the Google backend needs no
+  client library.
 - Vitest and React Testing Library; Playwright for one end-to-end pass.
 - GitHub Actions deploying to Pages. Vite `base` set to the repository path.
 
@@ -245,7 +283,9 @@ export. Target 80% overall, higher in `src/domain/`.
 
 | Risk | Mitigation |
 |---|---|
-| Apps Script *Anyone* deployment blocked | Step 1 spike; localStorage + JSON export fallback |
+| Apps Script *Anyone* deployment blocked | Step 1 spike; fall back to the Microsoft or local-only backend |
+| Entra admin consent withheld for a work tenant | Step 1 spike; fall back to the Google or local-only backend |
+| A backend-specific detail leaks into the UI | The connection form is generated from `adapter.validate()`; adding a fourth backend must touch only `src/storage/adapters/` |
 | Astryx is beta; APIs may shift | Pin exact versions; keep domain layer UI-independent |
 | Optimizer produces valid-but-unpleasant schedules | Invariant tests prove correctness; shape is tunable and isolated to one module |
 | Sheet edited by hand into an invalid state | Protected header ranges; validate on load and report rather than crash |
@@ -258,3 +298,7 @@ export. Target 80% overall, higher in `src/domain/`.
   debuggable and pasteable.
 - The floor uses `ceil`, never `round`.
 - Unplaced hours carry forward and are surfaced; they are never dropped.
+- Storage is pluggable. The two cloud backends deliberately authenticate differently —
+  a shared secret for Google, interactive sign-in for Microsoft — because Microsoft has
+  no anonymous endpoint equivalent to an Apps Script web app. Forcing them into one
+  auth model would have meant weakening the Microsoft one.
