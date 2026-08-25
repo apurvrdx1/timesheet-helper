@@ -11,6 +11,21 @@ export function keyOf(month: IsoMonth, otl: OtlCode): string {
   return `${month}|${otl}`;
 }
 
+/**
+ * The exact inverse of `keyOf`, kept beside it so encoder and decoder cannot
+ * drift. Parses on the first delimiter only: OTL codes are free text and may
+ * themselves contain '|'. The month is always fixed-width 'YYYY-MM'.
+ * Returns null for anything `keyOf` could not have produced.
+ */
+export function parseKey(key: string): { month: IsoMonth; otlProjectCode: OtlCode } | null {
+  const sep = key.indexOf('|');
+  if (sep === -1) return null;
+  return {
+    month: key.slice(0, sep) as IsoMonth,
+    otlProjectCode: key.slice(sep + 1) as OtlCode,
+  };
+}
+
 /** Per-person CAPEX assignments as blocks. Rows with a null personId are OTL totals. */
 export function assignmentBlocks(personId: PersonId, model: Model): Map<string, Blocks> {
   const out = new Map<string, Blocks>();
@@ -38,12 +53,9 @@ export function pacedDemand(
   for (const [key, blocks] of remaining) {
     if (blocks <= 0) continue;
 
-    // Parse on the first delimiter only: OTL codes are free text and may
-    // themselves contain '|'. The month is always fixed-width 'YYYY-MM'.
-    const sep = key.indexOf('|');
-    if (sep === -1) continue;
-    const month = key.slice(0, sep);
-    const otlProjectCode = key.slice(sep + 1);
+    const parsed = parseKey(key);
+    if (parsed === null) continue;
+    const { month, otlProjectCode } = parsed;
 
     const weekDays = weekWorkdaysByMonth.get(month) ?? 0;
     if (weekDays === 0) continue;
@@ -53,7 +65,7 @@ export function pacedDemand(
       ? blocks
       : Math.min(blocks, Math.ceil(blocks * (weekDays / monthDays)));
 
-    items.push({ otlProjectCode: otlProjectCode as OtlCode, month: month as IsoMonth, blocks: share });
+    items.push({ otlProjectCode, month, blocks: share });
   }
 
   // Stable: biggest first, then alphabetical. Never rely on Map iteration order.

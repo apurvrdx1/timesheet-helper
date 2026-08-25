@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { assignmentBlocks, keyOf, pacedDemand } from './demand';
+import { assignmentBlocks, keyOf, parseKey, pacedDemand } from './demand';
 import type { Model } from './types';
 
 const base: Model = {
@@ -105,5 +105,19 @@ describe('pacedDemand', () => {
       remaining, [], new Map([['2026-09', 5]]), new Map([['2026-09', 5]]),
     );
     expect(got).toEqual([{ otlProjectCode: otlWithPipe, month: '2026-09', blocks: 20 }]);
+  });
+});
+
+describe('parseKey', () => {
+  it('round-trips every key keyOf can produce, pipes in the code included', () => {
+    for (const code of ['P-1001', 'P-1001|SUB-A', 'OPEX ADMIN', '|leading']) {
+      expect(parseKey(keyOf('2026-09', code)))
+        .toEqual({ month: '2026-09', otlProjectCode: code });
+    }
+  });
+
+  it('returns null for a string keyOf could not have produced', () => {
+    expect(parseKey('2026-09')).toBeNull();
+    expect(parseKey('')).toBeNull();
   });
 });

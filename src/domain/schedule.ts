@@ -1,7 +1,7 @@
 import { hoursToBlocks } from './blocks';
 import { monthOf, weekDays, weeksTouchingMonth } from './calendar';
 import { leaveDatesFor } from './capacity';
-import { assignmentBlocks, keyOf, pacedDemand, type DemandItem } from './demand';
+import { assignmentBlocks, keyOf, pacedDemand, parseKey, type DemandItem } from './demand';
 import { scheduleWeek } from './optimizer';
 import type {
   Blocks, IsoDate, IsoMonth, Model, PersonId, Residual, ScheduleEntry,
@@ -122,12 +122,9 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
     // 4. Whatever the manager could not take carries forward.
     for (const [key, blocks] of remaining) {
       if (blocks <= 0) continue;
-      // Parse on the first delimiter only: OTL codes are free text and may
-      // themselves contain '|'. The month is always fixed-width 'YYYY-MM'.
-      const sep = key.indexOf('|');
-      if (sep === -1) continue;
-      const month = key.slice(0, sep);
-      const otlProjectCode = key.slice(sep + 1);
+      const parsed = parseKey(key);
+      if (parsed === null) continue;
+      const { month, otlProjectCode } = parsed;
       residuals.push({
         personId: null, otlProjectCode, month, blocks,
         reason: unassigned.has(key) ? 'UNASSIGNED' : 'UNABSORBED',
