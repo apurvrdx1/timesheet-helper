@@ -1,0 +1,6 @@
+@import '@astryxdesign/core/reset.css';
+@import '@astryxdesign/core/astryx.css';
+@import '@astryxdesign/theme-neutral/theme.css';
+
+/* Project-wide: every figure in this app is compared vertically. */
+.tabular { font-variant-numeric: tabular-nums; }
