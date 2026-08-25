@@ -38,6 +38,18 @@ describe('assignmentBlocks', () => {
     };
     expect(assignmentBlocks('p1', model).size).toBe(0);
   });
+
+  it('accumulates two rows for the same person, month, and OTL rather than overwriting', () => {
+    const model: Model = {
+      ...base,
+      allocations: [
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 20 },
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 30 },
+      ],
+    };
+    // 20h + 30h = 50h = 100 half-hour blocks, not 60 (the last row alone).
+    expect(assignmentBlocks('p1', model).get('2026-09|P-1001')).toBe(100);
+  });
 });
 
 describe('pacedDemand', () => {

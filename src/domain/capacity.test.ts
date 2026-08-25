@@ -98,4 +98,27 @@ describe('leaveDatesFor', () => {
     // You do not spend a vacation day on a day the company is closed.
     expect(leaveDatesFor('p1', weekDays('2026-09-14'), model).get('2026-09-16')).toBe('STAT-01');
   });
+
+  it('lets the later range win on a day two personal leave ranges overlap', () => {
+    // model.leave is iterated in array order and out.set() overwrites, so
+    // whichever range is listed last claims the overlapping day.
+    const model: Model = {
+      ...emptyModel,
+      leave: [
+        {
+          personId: 'p1', startDate: '2026-09-14', endDate: '2026-09-16',
+          otlProjectCode: 'VAC-EARLY',
+        },
+        {
+          personId: 'p1', startDate: '2026-09-16', endDate: '2026-09-18',
+          otlProjectCode: 'VAC-LATE',
+        },
+      ],
+    };
+    const got = leaveDatesFor('p1', weekDays('2026-09-14'), model);
+    expect(got.get('2026-09-16')).toBe('VAC-LATE');
+    // The non-overlapping days each still belong to their own range.
+    expect(got.get('2026-09-14')).toBe('VAC-EARLY');
+    expect(got.get('2026-09-18')).toBe('VAC-LATE');
+  });
 });
