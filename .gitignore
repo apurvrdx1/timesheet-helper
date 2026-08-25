@@ -7,3 +7,6 @@ test-results/
 .env
 .env.local
 .DS_Store
+
+# Tool artifact: local code index, not project source.
+.codebase-index-cache.json
