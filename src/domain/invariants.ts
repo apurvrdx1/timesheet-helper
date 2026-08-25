@@ -6,16 +6,16 @@ import {
 } from './types';
 
 /**
- * Checks the guarantees the optimizer claims to make. Violations caused
- * by user overrides are reported by the optimizer itself and excluded
- * here, so this only ever fires on a genuine scheduling bug.
+ * Checks the guarantees the optimizer claims to make. The OPEX floor is
+ * checked with a precise allowance for the shortfall the user's own override
+ * blocks genuinely force, rather than being skipped whenever any override
+ * exists, so this only ever fires on a genuine scheduling bug.
  */
 export function checkInvariants(
   model: Model, result: ScheduleResult, months: IsoMonth[],
 ): Violation[] {
   const problems: Violation[] = [];
   const defaultOpex = model.otls.find((o) => o.isDefaultOpex)?.projectCode;
-  const hasOverrides = model.overrides.length > 0;
 
   // Every entry is a positive integer number of blocks.
   for (const e of result.entries) {
@@ -60,16 +60,29 @@ export function checkInvariants(
         }
       }
 
-      // The OPEX floor holds, unless the user's own overrides broke it.
-      if (!hasOverrides && defaultOpex) {
+      // The OPEX floor holds, up to the shortfall the user's own override
+      // blocks genuinely force. Override blocks booked away from the default
+      // OPEX code are the only thing that can eat into the floor, and only
+      // once they exceed the week's non-OPEX room (capacity - floor); up to
+      // that point the optimizer must still find a compliant schedule.
+      // Leave entries are excluded from the OPEX total because `capacity`
+      // already excludes leave days — a leave code that happens to equal the
+      // default OPEX code must not be allowed to pay for the floor.
+      if (defaultOpex) {
         const capacity = dates.filter((d) => !leaveDates.has(d)).length * BLOCKS_PER_DAY;
-        const opexBlocks = mine.filter((e) => e.otlProjectCode === defaultOpex)
+        const floor = opexFloor(capacity);
+        const opexBlocks = mine
+          .filter((e) => e.otlProjectCode === defaultOpex && e.source !== 'LEAVE')
           .reduce((s, e) => s + e.blocks, 0);
-        if (capacity > 0 && opexBlocks < opexFloor(capacity)) {
+        const overriddenAway = mine
+          .filter((e) => e.source === 'OVERRIDE' && e.otlProjectCode !== defaultOpex)
+          .reduce((s, e) => s + e.blocks, 0);
+        const allowance = Math.max(0, floor - capacity + overriddenAway);
+        if (capacity > 0 && opexBlocks < floor - allowance) {
           problems.push({
             personId: person.id, scope: monday, kind: 'OPEX_FLOOR_BREACHED',
-            message: `Week of ${monday}: ${opexBlocks / 2}h OPEX, ` +
-                     `floor is ${opexFloor(capacity) / 2}h.`,
+            message: `Week of ${monday}: ${opexBlocks / 2}h OPEX, floor is ` +
+                     `${floor / 2}h and overrides excuse only ${allowance / 2}h of it.`,
           });
         }
       }

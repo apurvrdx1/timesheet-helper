@@ -77,7 +77,15 @@ export interface Residual {
 export interface Violation {
   personId: PersonId;
   scope: IsoDate | IsoMonth;
-  kind: 'DAY_NOT_FULL' | 'OPEX_FLOOR_BREACHED' | 'OVER_CAPACITY' | 'NEGATIVE';
+  kind:
+    | 'DAY_NOT_FULL'
+    | 'OPEX_FLOOR_BREACHED'
+    | 'OVER_CAPACITY'
+    | 'NEGATIVE'
+    /** An override landed on a day that leave had already claimed in full. */
+    | 'OVERRIDE_ON_LEAVE_DAY'
+    /** An override's hours did not divide into whole half-hour blocks. */
+    | 'OVERRIDE_RESIDUAL_DROPPED';
   message: string;
 }
 
