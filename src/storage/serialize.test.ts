@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { modelToRows, rowsToModel } from './serialize';
-import type { Model } from '../domain/types';
+import {
+  modelToRows, rowsToModel,
+  scheduleEntriesToRows, rowsToScheduleEntries,
+  metaToRows, rowsToMeta,
+  buildSheetPayload,
+} from './serialize';
+import type { Model, ScheduleEntry } from '../domain/types';
 
 const model: Model = {
   otls: [{
@@ -528,5 +533,125 @@ describe('serialize: malformed field validation (never throws, always reports)',
     });
     expect(problems.length).toBeGreaterThan(0);
     expect(model.overrides).toEqual([]);
+  });
+});
+
+// -----------------------------------------------------------------------
+// Task 15: Schedule and Meta tabs.
+// -----------------------------------------------------------------------
+
+const scheduleEntries: ScheduleEntry[] = [
+  {
+    personId: 'p1', date: '2026-09-01', otlProjectCode: 'P-1001',
+    blocks: 15, source: 'CALC', overrideBlocks: 0,
+  },
+  {
+    // A pinned cell: `source` says "locked", `overrideBlocks` says the user
+    // only pinned 4 of the 15 blocks — the optimizer topped the rest up to
+    // fill the day. These must round-trip as two distinct numbers, not one.
+    personId: 'p1', date: '2026-09-02', otlProjectCode: 'P-1002',
+    blocks: 15, source: 'OVERRIDE', overrideBlocks: 4,
+  },
+  {
+    personId: 'p2', date: '2026-09-01', otlProjectCode: 'LEAVE-01',
+    blocks: 15, source: 'LEAVE', overrideBlocks: 0,
+  },
+];
+
+describe('serialize: Schedule tab', () => {
+  it('round-trips schedule entries without loss', () => {
+    const { entries, problems } = rowsToScheduleEntries({
+      Schedule: scheduleEntriesToRows(scheduleEntries),
+    });
+    expect(problems).toEqual([]);
+    expect(entries).toEqual(scheduleEntries);
+  });
+
+  it('keeps overrideBlocks distinct from blocks and source through a round trip', () => {
+    const { entries } = rowsToScheduleEntries({
+      Schedule: scheduleEntriesToRows(scheduleEntries),
+    });
+    const pinned = entries.find((e) => e.date === '2026-09-02');
+    // source says "locked" but only 4 of the 15 blocks were user input —
+    // losing this distinction is exactly the bug the round trip must avoid.
+    expect(pinned?.source).toBe('OVERRIDE');
+    expect(pinned?.blocks).toBe(15);
+    expect(pinned?.overrideBlocks).toBe(4);
+  });
+
+  it('writes a header row', () => {
+    const rows = scheduleEntriesToRows(scheduleEntries);
+    expect(rows[0]).toEqual([
+      'personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks',
+    ]);
+  });
+
+  it('returns no entries for a missing Schedule tab', () => {
+    const { entries, problems } = rowsToScheduleEntries({});
+    expect(entries).toEqual([]);
+    expect(problems).toEqual([]);
+  });
+
+  it('reports a malformed Schedule row instead of throwing', () => {
+    const { entries, problems } = rowsToScheduleEntries({
+      Schedule: [
+        ['personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks'],
+        ['p1', '2026-09-01', 'P-1001', 'not-a-number', 'CALC', '0'],
+      ],
+    });
+    expect(entries).toEqual([]);
+    expect(problems.length).toBeGreaterThan(0);
+  });
+
+  it('rejects an invalid source enum value', () => {
+    const { entries, problems } = rowsToScheduleEntries({
+      Schedule: [
+        ['personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks'],
+        ['p1', '2026-09-01', 'P-1001', '15', 'BOGUS', '0'],
+      ],
+    });
+    expect(entries).toEqual([]);
+    expect(problems.length).toBeGreaterThan(0);
+  });
+
+  it('rejects an overrideBlocks that is not a number', () => {
+    const { entries, problems } = rowsToScheduleEntries({
+      Schedule: [
+        ['personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks'],
+        ['p1', '2026-09-01', 'P-1001', '15', 'CALC', 'nope'],
+      ],
+    });
+    expect(entries).toEqual([]);
+    expect(problems.length).toBeGreaterThan(0);
+  });
+});
+
+describe('serialize: Meta tab', () => {
+  it('round-trips the model hash', () => {
+    const { hash, problems } = rowsToMeta({ Meta: metaToRows('abc123') });
+    expect(problems).toEqual([]);
+    expect(hash).toBe('abc123');
+  });
+
+  it('returns null for a missing Meta tab', () => {
+    const { hash, problems } = rowsToMeta({});
+    expect(hash).toBeNull();
+    expect(problems).toEqual([]);
+  });
+
+  it('writes a key/value header row', () => {
+    const rows = metaToRows('abc123');
+    expect(rows[0]).toEqual(['key', 'value']);
+  });
+});
+
+describe('serialize: buildSheetPayload', () => {
+  it('combines the model tabs with the Schedule and Meta tabs', () => {
+    const payload = buildSheetPayload(model, scheduleEntries, 'abc123');
+    expect(payload.OTLs).toEqual(modelToRows(model).OTLs);
+    const { entries } = rowsToScheduleEntries(payload);
+    expect(entries).toEqual(scheduleEntries);
+    const { hash } = rowsToMeta(payload);
+    expect(hash).toBe('abc123');
   });
 });

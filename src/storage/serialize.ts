@@ -24,6 +24,8 @@ import type {
   LeaveRange,
   Override,
   LeaveSubtype,
+  ScheduleEntry,
+  EntrySource,
 } from '../domain/types';
 
 export type TabName =
@@ -442,13 +444,157 @@ function rowToOverride(row: string[], rowNum: number, problems: string[]): Overr
 }
 
 // ---------------------------------------------------------------------------
+// Schedule — the optimizer's output, not part of `Model`. Serialized
+// separately from `modelToRows`/`rowsToModel` because a `ScheduleEntry[]`
+// comes from `scheduleAll`, not from the domain model itself.
+//
+// `overrideBlocks` MUST round-trip as its own column, distinct from
+// `blocks` and `source`: `source` says whether the UI should lock a cell,
+// `overrideBlocks` says how many of its blocks the user actually pinned.
+// A pinned cell can have `source: 'OVERRIDE'` with `overrideBlocks` less
+// than `blocks` (the optimizer topped the rest up to fill the day) — losing
+// that distinction on save/reload is exactly the bug this column exists to
+// prevent.
+// ---------------------------------------------------------------------------
+
+const SCHEDULE_COLUMNS = [
+  'personId',
+  'date',
+  'otlProjectCode',
+  'blocks',
+  'source',
+  'overrideBlocks',
+] as const satisfies readonly (keyof ScheduleEntry)[];
+
+const ENTRY_SOURCES: readonly EntrySource[] = ['CALC', 'OVERRIDE', 'LEAVE'];
+
+function scheduleEntryToRow(e: ScheduleEntry): string[] {
+  return SCHEDULE_COLUMNS.map((col) => encodeCell(e[col]));
+}
+
+function rowToScheduleEntry(
+  row: string[],
+  rowNum: number,
+  problems: string[],
+): ScheduleEntry | undefined {
+  if (!checkRowLength(row, SCHEDULE_COLUMNS, 'Schedule', rowNum, problems)) return undefined;
+
+  const personId = row[0] ?? '';
+  const date = row[1] ?? '';
+  const otlProjectCode = row[2] ?? '';
+  const blocksRaw = row[3] ?? '';
+  const sourceRaw = row[4] ?? '';
+  const overrideBlocksRaw = row[5] ?? '';
+
+  if (personId === '') {
+    problems.push(`Schedule row ${rowNum}: missing personId`);
+    return undefined;
+  }
+  if (!isValidIsoDate(date)) {
+    problems.push(`Schedule row ${rowNum}: invalid date "${date}"`);
+    return undefined;
+  }
+  if (otlProjectCode === '') {
+    problems.push(`Schedule row ${rowNum}: missing otlProjectCode`);
+    return undefined;
+  }
+
+  const blocks = parseNumber(blocksRaw);
+  if (blocks === undefined) {
+    problems.push(`Schedule row ${rowNum}: invalid number blocks "${blocksRaw}"`);
+    return undefined;
+  }
+
+  const source = parseEnum(sourceRaw, ENTRY_SOURCES);
+  if (source === undefined) {
+    problems.push(`Schedule row ${rowNum}: invalid source "${sourceRaw}"`);
+    return undefined;
+  }
+
+  const overrideBlocks = parseNumber(overrideBlocksRaw);
+  if (overrideBlocks === undefined) {
+    problems.push(`Schedule row ${rowNum}: invalid number overrideBlocks "${overrideBlocksRaw}"`);
+    return undefined;
+  }
+
+  return { personId, date, otlProjectCode, blocks, source, overrideBlocks };
+}
+
+/** Converts `scheduleAll`'s entries to the `Schedule` tab's rows. */
+export function scheduleEntriesToRows(entries: ScheduleEntry[]): string[][] {
+  return [[...SCHEDULE_COLUMNS], ...entries.map(scheduleEntryToRow)];
+}
+
+/**
+ * Converts the `Schedule` tab's rows back to `ScheduleEntry[]`. Same
+ * never-throw contract as `rowsToModel`: a malformed row is reported and
+ * skipped, not fatal to the rest of the sheet.
+ */
+export function rowsToScheduleEntries(
+  payload: Partial<SheetPayload>,
+): { entries: ScheduleEntry[]; problems: string[] } {
+  const problems: string[] = [];
+  const entries = parseTab(payload, 'Schedule', SCHEDULE_COLUMNS, rowToScheduleEntry, problems);
+  return { entries, problems };
+}
+
+// ---------------------------------------------------------------------------
+// Meta — a flat key/value tab. Currently carries just the model hash the
+// Schedule tab was last calculated against, so a backend read can tell
+// whether the stored schedule is stale without recomputing it first.
+// ---------------------------------------------------------------------------
+
+const META_COLUMNS = ['key', 'value'] as const;
+const MODEL_HASH_KEY = 'modelHash';
+
+/** Converts the current model hash to the `Meta` tab's rows. */
+export function metaToRows(hash: string): string[][] {
+  return [[...META_COLUMNS], [MODEL_HASH_KEY, hash]];
+}
+
+/**
+ * Reads the model hash back out of the `Meta` tab. `hash` is `null` when the
+ * tab is missing or carries no `modelHash` row — never thrown.
+ */
+export function rowsToMeta(
+  payload: Partial<SheetPayload>,
+): { hash: string | null; problems: string[] } {
+  const problems: string[] = [];
+  const rows = payload.Meta ?? [];
+  if (rows.length === 0) return { hash: null, problems };
+
+  const header = rows[0] ?? [];
+  const headerMatches =
+    header.length === META_COLUMNS.length && META_COLUMNS.every((c, i) => header[i] === c);
+  if (!headerMatches) {
+    problems.push(
+      `Meta: header row does not match expected columns [${META_COLUMNS.join(', ')}]; got [${header.join(', ')}]`,
+    );
+    return { hash: null, problems };
+  }
+
+  for (let i = 1; i < rows.length; i += 1) {
+    const row = rows[i] ?? [];
+    if (row.length !== META_COLUMNS.length) {
+      problems.push(`Meta row ${i + 1}: expected ${META_COLUMNS.length} columns, got ${row.length}`);
+      continue;
+    }
+    if (row[0] === MODEL_HASH_KEY) {
+      return { hash: row[1] ?? '', problems };
+    }
+  }
+
+  return { hash: null, problems };
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Converts the domain `Model` to sheet rows. `Schedule` and `Meta` are not
- * produced here (Task 15 owns them); they come back as empty tabs so the
- * `SheetPayload` shape is always complete.
+ * Converts the domain `Model` to sheet rows. `Schedule` and `Meta` come back
+ * empty here — populate them with `scheduleEntriesToRows`/`metaToRows` (or
+ * use `buildSheetPayload`) once a `ScheduleResult` and hash exist.
  */
 export function modelToRows(model: Model): SheetPayload {
   return {
@@ -495,5 +641,22 @@ export function rowsToModel(payload: Partial<SheetPayload>): { model: Model; pro
   return {
     model: { otls, people, statHolidays, allocations, leave, overrides },
     problems,
+  };
+}
+
+/**
+ * Composes the full `SheetPayload` a write to a backend should send: the six
+ * model tabs plus the current `Schedule` (from the latest `scheduleAll`) and
+ * `Meta` (the hash it was calculated against).
+ */
+export function buildSheetPayload(
+  model: Model,
+  entries: ScheduleEntry[],
+  hash: string,
+): SheetPayload {
+  return {
+    ...modelToRows(model),
+    Schedule: scheduleEntriesToRows(entries),
+    Meta: metaToRows(hash),
   };
 }

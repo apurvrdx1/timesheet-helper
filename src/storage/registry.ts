@@ -29,3 +29,61 @@ export function getAdapter(id: BackendId): StorageAdapter {
 export function listAdapters(): StorageAdapter[] {
   return Object.values(ADAPTERS);
 }
+
+// ---------------------------------------------------------------------------
+// Connection-form metadata. `StorageAdapter.validate()` decides whether a
+// config is *complete*; this decides which fields the form shows in the
+// first place. Both live behind this one file's exclusive knowledge of
+// backend ids so `src/ui/` never branches on a backend name — it just reads
+// `getConnectionFields(config.backend)`/`getConnectionNotice(config.backend)`
+// and renders whatever comes back.
+// ---------------------------------------------------------------------------
+
+export interface ConnectionField {
+  /** Which `BackendConfig` property this field edits. */
+  key: 'location' | 'secret' | 'clientId';
+  label: string;
+  type: 'text' | 'password';
+}
+
+export interface ConnectionNotice {
+  message: string;
+  href: string;
+  linkLabel: string;
+}
+
+const CONNECTION_FIELDS: Record<BackendId, ConnectionField[]> = {
+  local: [],
+  google: [
+    { key: 'location', label: 'Script URL', type: 'text' },
+    { key: 'secret', label: 'Shared secret', type: 'password' },
+  ],
+  microsoft: [
+    { key: 'clientId', label: 'Client id', type: 'text' },
+    { key: 'location', label: 'Workbook link', type: 'text' },
+  ],
+};
+
+const CONNECTION_NOTICES: Partial<Record<BackendId, ConnectionNotice>> = {
+  google: {
+    message: 'Deploy the Apps Script web app from this repository before connecting.',
+    href: 'apps-script/README.md',
+    linkLabel: 'Apps Script setup guide',
+  },
+  microsoft: {
+    message:
+      'If this is a work or school account, an administrator may need to approve the app before you can sign in.',
+    href: 'docs/microsoft-setup.md',
+    linkLabel: 'Microsoft 365 setup guide',
+  },
+};
+
+/** The fields a connection form should show for this backend, in order. */
+export function getConnectionFields(id: BackendId): ConnectionField[] {
+  return CONNECTION_FIELDS[id];
+}
+
+/** A backend-specific caveat to show inline on the connection form, if any. */
+export function getConnectionNotice(id: BackendId): ConnectionNotice | undefined {
+  return CONNECTION_NOTICES[id];
+}
