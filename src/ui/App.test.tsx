@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { App, ErrorBoundary } from './App';
+import { App, ErrorBoundary, planNoticeBanner } from './App';
 
 // jsdom (this project's `src/test-setup.ts`, which this file must not edit
 // per the storage-isolation constraint other page tests document) does not
@@ -284,5 +284,110 @@ describe('ErrorBoundary: the promise it makes is backed by what it does', () => 
     expect(screen.getByText(/on this page/i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
     consoleError.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N6 regression: severity was decided by which slot a message landed in, not
+// by what the message said. A single skipped malformed row rendered as a
+// persistent red error banner, and a real "could not save to the backend"
+// failure was demoted to description text under it, losing its error
+// styling entirely.
+// ---------------------------------------------------------------------------
+
+describe('planNoticeBanner: severity follows the message, not the slot', () => {
+  const clean = {
+    dataNotice: null,
+    hasUnreadableTab: false,
+    notice: null,
+    status: 'idle' as const,
+    staleReason: null,
+  };
+
+  it('has nothing to say when nothing is live', () => {
+    expect(planNoticeBanner(clean)).toBeNull();
+  });
+
+  it('treats a skipped row as informational, not an error', () => {
+    const plan = planNoticeBanner({
+      ...clean,
+      dataNotice: "Loaded with 1 problem(s) in the backend's data — see the console for detail.",
+    });
+    expect(plan?.status).toBe('info');
+    expect(plan?.title).toMatch(/1 problem/);
+  });
+
+  it('treats a tab that could not be read at all as an error', () => {
+    const plan = planNoticeBanner({
+      ...clean,
+      dataNotice: 'The People tab could not be read: …',
+      hasUnreadableTab: true,
+    });
+    expect(plan?.status).toBe('error');
+  });
+
+  it('keeps a save failure at error severity and in the lead, even beside a skipped row', () => {
+    const plan = planNoticeBanner({
+      ...clean,
+      dataNotice: "Loaded with 1 problem(s) in the backend's data — see the console for detail.",
+      notice: 'Could not save to the backend: quota exceeded. Your changes are kept locally.',
+      status: 'error',
+    });
+    expect(plan?.status).toBe('error');
+    expect(plan?.title).toMatch(/could not save to the backend/i);
+    expect(plan?.description).toMatch(/1 problem/);
+  });
+
+  it('leaves an unreadable tab in the lead when both are errors', () => {
+    const plan = planNoticeBanner({
+      ...clean,
+      dataNotice: 'The People tab could not be read: …',
+      hasUnreadableTab: true,
+      notice: 'Could not save to the backend: quota exceeded. Your changes are kept locally.',
+      status: 'error',
+    });
+    expect(plan?.status).toBe('error');
+    expect(plan?.title).toMatch(/People tab could not be read/);
+    expect(plan?.description).toMatch(/could not save to the backend/i);
+  });
+
+  it('does not swallow a sync notice behind the stale message', () => {
+    const plan = planNoticeBanner({
+      ...clean,
+      notice: 'Could not reach the backend (network down). Showing your last saved copy.',
+      status: 'offline',
+      staleReason: 'The schedule changed since the last recalculation — results are out of date.',
+    });
+    expect(plan?.status).toBe('error');
+    expect(plan?.title).toMatch(/could not reach the backend/i);
+    expect(plan?.description).toMatch(/out of date/);
+  });
+});
+
+describe('App: a skipped row is an informational notice, not a red error', () => {
+  it('renders the row-level data notice without error styling', async () => {
+    // The tab's header is fine; one row carries an unparseable role, so it
+    // is skipped and reported. Nothing is being withheld from the backend.
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify({
+      People: [
+        ['id', 'name', 'role', 'managerId'],
+        ['p1', 'Alex', 'BOSS', ''],
+        ['p2', 'Sam', 'REPORT', ''],
+      ],
+    }));
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    render(<App />);
+    await settle();
+
+    const notice = screen.getByText(/1 problem\(s\) in the backend's data/i);
+    expect(notice).toBeInTheDocument();
+    // Astryx's Banner gives an error status the assertive `role="alert"` and
+    // an informational one the polite `role="status"`, so the ARIA role of
+    // the banner this message sits in IS its severity.
+    expect(notice.closest('[role="alert"]')).toBeNull();
+    expect(notice.closest('[role="status"]')).not.toBeNull();
+
+    consoleWarn.mockRestore();
   });
 });

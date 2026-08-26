@@ -20,6 +20,7 @@ import { SetupPage } from './pages/SetupPage';
 import { AllocationsPage } from './pages/AllocationsPage';
 import { WeeksPage } from './pages/WeeksPage';
 import { useStore } from '../storage/store';
+import type { StoreStatus } from '../storage/store';
 import type { IsoMonth, Model } from '../domain/types';
 
 type TabValue = 'setup' | 'allocations' | 'weeks';
@@ -64,6 +65,72 @@ const RECOVERY_HINT_ELSEWHERE =
 
 const RECOVERY_HINT_HERE =
   'Your data is safe — nothing was saved over. Fix the cause in the data on this page, then press Try again.';
+
+/**
+ * Which message leads the one banner, and how loudly it speaks.
+ *
+ * Two messages can be live at once — a data-integrity notice about the last
+ * read, and a sync notice about the last write — and DESIGN.md §3 allows
+ * exactly one banner, so they merge. The severity is what went wrong, and it
+ * used to be decided by which slot a message landed in rather than by what it
+ * said:
+ *
+ * - A single skipped malformed row is informational: the rest of the sheet
+ *   loaded, nothing is being withheld, and there is nothing to do right now.
+ *   It rendered as a persistent red error.
+ * - A tab that could not be read at all IS an error: data in the spreadsheet
+ *   the app cannot see, and the user's edits to it are going nowhere.
+ * - "Could not save to the backend" is an error whenever `status` says so,
+ *   and it used to be demoted to description text under an informational
+ *   data notice, losing its error styling entirely.
+ *
+ * So severity is assigned per message, error-severity messages lead, and the
+ * banner takes the severity of whichever message leads.
+ */
+export interface NoticeBannerPlan {
+  status: 'error' | 'info';
+  title: string;
+  description: string;
+}
+
+interface NoticeBannerInput {
+  dataNotice: string | null;
+  /** True when the data notice is about a tab that could not be read at all,
+   *  rather than rows that were skipped. */
+  hasUnreadableTab: boolean;
+  notice: string | null;
+  status: StoreStatus;
+  /** The stale message, when the schedule is out of date. Always trails: it
+   *  is a statement about the schedule, and it carries its own action. */
+  staleReason: string | null;
+}
+
+export function planNoticeBanner({
+  dataNotice, hasUnreadableTab, notice, status, staleReason,
+}: NoticeBannerInput): NoticeBannerPlan | null {
+  const messages: Array<{ severity: 'error' | 'info'; text: string }> = [];
+  if (dataNotice !== null && dataNotice !== '') {
+    messages.push({ severity: hasUnreadableTab ? 'error' : 'info', text: dataNotice });
+  }
+  if (notice !== null && notice !== '') {
+    const isSyncFailure = status === 'error' || status === 'offline';
+    messages.push({ severity: isSyncFailure ? 'error' : 'info', text: notice });
+  }
+  if (messages.length === 0) return null;
+
+  const errors = messages.filter((message) => message.severity === 'error');
+  const ordered = [...errors, ...messages.filter((message) => message.severity !== 'error')];
+  const lead = ordered[0];
+  if (lead === undefined) return null;
+
+  return {
+    status: lead.severity,
+    title: lead.text,
+    description: [...ordered.slice(1).map((message) => message.text), staleReason]
+      .filter((text): text is string => text !== null && text !== '')
+      .join(' '),
+  };
+}
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -132,7 +199,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
 export function App() {
   const {
-    model, isStale, status, notice, dataNotice,
+    model, isStale, status, notice, dataNotice, unreadableTabs,
     update, cancelPendingPush, recalculate, config, connect,
   } = useStore();
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
@@ -157,6 +224,14 @@ export function App() {
   // this adapts one shape to the other in exactly one place.
   const applyModel = useCallback((next: Model) => update(() => next), [update]);
 
+  const bannerPlan = planNoticeBanner({
+    dataNotice,
+    hasUnreadableTab: unreadableTabs.length > 0,
+    notice,
+    status,
+    staleReason: isStale ? STALE_REASON : null,
+  });
+
   return (
     <Theme theme={neutralTheme}>
       <Section variant="section" maxWidth={1440} padding={8}>
@@ -176,22 +251,20 @@ export function App() {
           content={
             <LayoutContent>
               {/* One banner at a time (DESIGN.md §3) — merged, never stacked.
-                  A data-integrity problem outranks everything else: it means
-                  the spreadsheet holds data the app cannot see, and only the
-                  user can fix it. So it takes the title, the other live
-                  messages fall in behind it as the description, and the
-                  Recalculate action stays attached when the schedule is stale
-                  too. Suppressing it behind the stale banner (which is up on
-                  exactly this load, because Meta's hash was written against
-                  the intact model) is how the user used to never hear about
-                  it at all. */}
-              {dataNotice !== null ? (
+                  `planNoticeBanner` decides which live message leads and how
+                  loudly the banner speaks; the Recalculate action stays
+                  attached whenever the schedule is stale, so a data or sync
+                  message never costs the user the primary action. With no
+                  message live at all, the stale banner stands on its own.
+                  Suppressing a data-integrity problem behind the stale banner
+                  (which is up on exactly that load, because Meta's hash was
+                  written against the intact model) is how the user used to
+                  never hear about it at all. */}
+              {bannerPlan !== null ? (
                 <Banner
-                  status="error"
-                  title={dataNotice}
-                  description={[isStale ? STALE_REASON : null, notice]
-                    .filter((message): message is string => message !== null && message !== '')
-                    .join(' ')}
+                  status={bannerPlan.status}
+                  title={bannerPlan.title}
+                  description={bannerPlan.description}
                   collapsible={false}
                   endContent={
                     isStale ? (
@@ -200,20 +273,11 @@ export function App() {
                   }
                 />
               ) : (
-                <>
-                  <StaleBanner
-                    isStale={isStale}
-                    reason={STALE_REASON}
-                    onRecalculate={recalculate}
-                  />
-                  {!isStale && notice && (
-                    <Banner
-                      status={status === 'error' || status === 'offline' ? 'error' : 'info'}
-                      title={notice}
-                      collapsible={false}
-                    />
-                  )}
-                </>
+                <StaleBanner
+                  isStale={isStale}
+                  reason={STALE_REASON}
+                  onRecalculate={recalculate}
+                />
               )}
               <TabList
                 value={activeTab}
