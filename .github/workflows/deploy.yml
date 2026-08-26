@@ -18,7 +18,13 @@ jobs:
         with: { node-version: '22', cache: 'npm' }
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      # Replaces `npm test`, not just adds to it: `coverage` runs the exact
+      # same vitest suite with v8 instrumentation and then enforces
+      # vitest.config.ts's thresholds (80 lines/functions/statements, 75
+      # branches), failing the job — and blocking deploy — if either the
+      # tests or the coverage bar fail. Running `npm test` first would only
+      # duplicate the whole suite for no extra signal.
+      - run: npm run coverage
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
       - run: npm run build
