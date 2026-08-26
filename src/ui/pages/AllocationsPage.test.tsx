@@ -64,4 +64,38 @@ describe('AllocationsPage', () => {
     render(<AllocationsPage model={withOpex} month="2026-09" update={vi.fn()} onMonthChange={vi.fn()} />);
     expect(screen.queryByText('OPEX-ADMIN')).not.toBeInTheDocument();
   });
+
+  // I5: the grid's optimistic overlay (AllocationGrid's `localHours`) must
+  // not survive a month switch. AllocationGrid is never remounted when only
+  // its `month` prop changes, so a stale entry left keyed by person+OTL
+  // alone would both display under the new month and — because the input's
+  // own displayed value is that stale figure — write for real into the new
+  // month on the very next edit.
+  it('does not leak a value typed for one month into a different month', async () => {
+    const update = vi.fn();
+    const { rerender } = render(
+      <AllocationsPage model={model} month="2026-09" update={update} onMonthChange={vi.fn()} />,
+    );
+
+    await userEvent.type(screen.getByLabelText(/Alex.*P-1001/i), '40');
+    await userEvent.tab();
+
+    rerender(<AllocationsPage model={model} month="2026-10" update={update} onMonthChange={vi.fn()} />);
+
+    const octoberCell = screen.getByLabelText(/Alex.*P-1001/i);
+    expect(octoberCell).toHaveValue('—');
+
+    update.mockClear();
+    // A single step (arrow-up on the focused field, no visible stepper
+    // button needed) is enough to turn the stale displayed value into a
+    // real write — this is the "one click makes them real" half of I5.
+    await userEvent.click(octoberCell);
+    await userEvent.keyboard('{ArrowUp}');
+
+    expect(update).toHaveBeenCalledTimes(1);
+    const [writtenModel] = update.mock.calls[0] as [Model];
+    expect(writtenModel.allocations).toEqual([
+      { month: '2026-10', otlProjectCode: 'P-1001', personId: 'p1', hours: 0.5 },
+    ]);
+  });
 });

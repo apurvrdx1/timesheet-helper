@@ -40,8 +40,13 @@ export interface AllocationGridProps {
 // Tolerance for float noise when comparing hours against the half-hour grid.
 const EPSILON = 1e-6;
 
-function cellKey(personId: PersonId | null, otlProjectCode: string): string {
-  return `${personId ?? 'TEAM'}|${otlProjectCode}`;
+// Keyed on month too: without it, a value typed for one month survives in
+// this optimistic overlay after the picker moves to a different month (the
+// component is never remounted on a month change), so the stale figure both
+// displays under the wrong month and — because the input's own value is that
+// stale figure — writes for real into the new month on the next edit.
+function cellKey(month: IsoMonth, personId: PersonId | null, otlProjectCode: string): string {
+  return `${month}|${personId ?? 'TEAM'}|${otlProjectCode}`;
 }
 
 /** The part of `hours` past the last whole half-hour block, rounded to avoid float noise. */
@@ -98,19 +103,19 @@ export function AllocationGrid({ model, month, update }: AllocationGridProps) {
   const monthDates = workingDatesInMonth(month);
 
   const cellValue = (personId: PersonId | null, otlProjectCode: string): number => {
-    const key = cellKey(personId, otlProjectCode);
+    const key = cellKey(month, personId, otlProjectCode);
     return key in localHours ? (localHours[key] as number) : getHours(model, month, personId, otlProjectCode);
   };
 
   const handleChange = (personId: PersonId | null, otlProjectCode: string, hours: number): void => {
-    setLocalHours((prev) => ({ ...prev, [cellKey(personId, otlProjectCode)]: hours }));
+    setLocalHours((prev) => ({ ...prev, [cellKey(month, personId, otlProjectCode)]: hours }));
     update(upsertAllocation(model, month, otlProjectCode, personId, hours));
   };
 
   // Never block typing: the residual is only surfaced on blur, once the
   // user has committed a value, not on every keystroke.
   const handleBlur = (personId: PersonId | null, otlProjectCode: string): void => {
-    const key = cellKey(personId, otlProjectCode);
+    const key = cellKey(month, personId, otlProjectCode);
     const residual = fractionalResidual(cellValue(personId, otlProjectCode));
     setResiduals((prev) => {
       if (residual > EPSILON) {
@@ -142,7 +147,7 @@ export function AllocationGrid({ model, month, update }: AllocationGridProps) {
   };
 
   function renderCell(personId: PersonId | null, personLabel: string, otlProjectCode: string) {
-    const key = cellKey(personId, otlProjectCode);
+    const key = cellKey(month, personId, otlProjectCode);
     const residual = residuals[key];
     const isZero = cellValue(personId, otlProjectCode) === 0;
     return (
