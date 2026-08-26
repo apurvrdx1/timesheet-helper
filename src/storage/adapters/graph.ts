@@ -64,21 +64,51 @@ function columnName(n: number): string {
   return out;
 }
 
+/**
+ * `usedRange`'s `address` comes back sheet-qualified (e.g. `Sheet1!A1:F27`),
+ * but `range(address='...')` wants a bare address. Strip everything up to
+ * and including the last `!`; if there is none, the value was already bare.
+ */
+function stripSheetPrefix(address: string): string {
+  const bang = address.lastIndexOf('!');
+  return bang === -1 ? address : address.slice(bang + 1);
+}
+
 export async function writeWorksheet(
   token: string, itemId: string, name: string, rows: string[][],
 ): Promise<void> {
   const sheet = encodeURIComponent(name);
   const base = `/me/drive/items/${itemId}/workbook/worksheets('${sheet}')`;
 
-  // Create on demand — a fresh workbook has none of our sheets.
-  const clear = await call(token, `${base}/usedRange/clear`, {
-    method: 'POST', body: JSON.stringify({ applyTo: 'contents' }),
-  });
-  if (clear.status === 404) {
-    await call(token, `/me/drive/items/${itemId}/workbook/worksheets`, {
+  // usedRange is the only way to learn what to clear: there is no
+  // `usedRange/clear` endpoint (usedRange is a read-only function and
+  // cannot be chained with `/clear` — the only documented clear paths take
+  // an explicit `range(address='...')`). A 404 here means the worksheet
+  // genuinely does not exist yet, so create it and skip the clear.
+  const usedRange = await call(token, `${base}/usedRange(valuesOnly=true)`);
+  if (usedRange.status === 404) {
+    const created = await call(token, `/me/drive/items/${itemId}/workbook/worksheets`, {
       method: 'POST', body: JSON.stringify({ name }),
     });
+    if (!created.ok) throw new Error(`Could not create the "${name}" sheet.`);
+  } else if (usedRange.ok) {
+    const body: unknown = await usedRange.json();
+    const rawAddress =
+      typeof body === 'object' && body !== null && 'address' in body
+        ? (body as { address: unknown }).address
+        : undefined;
+    if (typeof rawAddress !== 'string') {
+      throw new Error(`The Graph API returned an unexpected response for the "${name}" sheet.`);
+    }
+    const address = stripSheetPrefix(rawAddress);
+    const clear = await call(token, `${base}/range(address='${address}')/clear`, {
+      method: 'POST', body: JSON.stringify({ applyTo: 'contents' }),
+    });
+    if (!clear.ok) throw new Error(`Could not clear the "${name}" sheet before writing.`);
+  } else {
+    throw new Error(`Could not write the "${name}" sheet.`);
   }
+
   if (rows.length === 0) return;
 
   const firstRow = rows[0] ?? [];
