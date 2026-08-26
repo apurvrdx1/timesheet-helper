@@ -734,3 +734,83 @@ describe('serialize: buildSheetPayload omitTabs', () => {
     expect(Object.keys(buildSheetPayload(model, scheduleEntries, 'abc123'))).toHaveLength(8);
   });
 });
+
+// ---------------------------------------------------------------------------
+// N2 regression: Google's `getDataRange().getDisplayValues()` sizes its
+// rectangle to the sheet's USED RANGE, so one stray note anywhere in a tab
+// pads every row — the header included — with a trailing ''. Declaring the
+// tab unreadable for that is a false verdict, and a falsely-unreadable tab is
+// now frozen: every later edit to it silently never reaches the backend.
+// ---------------------------------------------------------------------------
+
+describe('serialize: used-range padding is not a header mismatch', () => {
+  it('reads a People tab whose rows were padded by a note in a fifth column', () => {
+    const { model: parsed, problems, unreadableTabs } = rowsToModel({
+      People: [
+        ['id', 'name', 'role', 'managerId', ''],
+        ['p1', 'Alex', 'MANAGER', '', ''],
+        ['p2', 'Sam', 'REPORT', 'p1', ''],
+      ],
+    });
+
+    expect(unreadableTabs).toEqual([]);
+    expect(problems).toEqual([]);
+    expect(parsed.people).toEqual([
+      { id: 'p1', name: 'Alex', role: 'MANAGER', managerId: null },
+      { id: 'p2', name: 'Sam', role: 'REPORT', managerId: 'p1' },
+    ]);
+  });
+
+  it('still rejects a renamed header that happens to carry the same padding', () => {
+    const { model: parsed, unreadableTabs } = rowsToModel({
+      People: [['id', 'name', 'Role', 'managerId', ''], ['p1', 'Alex', 'MANAGER', '', '']],
+    });
+    expect(unreadableTabs).toEqual(['People']);
+    expect(parsed.people).toEqual([]);
+  });
+
+  it('still rejects a reordered header that happens to carry the same padding', () => {
+    const { model: parsed, unreadableTabs } = rowsToModel({
+      People: [['name', 'id', 'role', 'managerId', ''], ['Alex', 'p1', 'MANAGER', '', '']],
+    });
+    expect(unreadableTabs).toEqual(['People']);
+    expect(parsed.people).toEqual([]);
+  });
+
+  it('never trims a legitimately empty last column away', () => {
+    // `managerId` is empty for a top-level manager. Trimming trailing blanks
+    // without a floor at the expected width would turn this into a
+    // "expected 4 columns, got 3" row-length problem.
+    const { model: parsed, problems } = rowsToModel({
+      People: [['id', 'name', 'role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
+    });
+    expect(problems).toEqual([]);
+    expect(parsed.people).toEqual([{ id: 'p1', name: 'Alex', role: 'MANAGER', managerId: null }]);
+  });
+
+  it('still reports a row padded with a real value rather than a blank', () => {
+    const { model: parsed, problems } = rowsToModel({
+      People: [
+        ['id', 'name', 'role', 'managerId', ''],
+        ['p1', 'Alex', 'MANAGER', '', 'a note'],
+        ['p2', 'Sam', 'REPORT', 'p1', ''],
+      ],
+    });
+    expect(problems.some((p) => /People row 2: expected 4 columns, got 5/.test(p))).toBe(true);
+    expect(parsed.people).toHaveLength(1);
+  });
+
+  it('tolerates the same padding on the Schedule and Meta tabs', () => {
+    expect(
+      rowsToScheduleEntries({
+        Schedule: [
+          ['personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks', ''],
+          ['p1', '2026-09-07', 'P-1001', '2', 'CALC', '0', ''],
+        ],
+      }).unreadableTabs,
+    ).toEqual([]);
+
+    expect(rowsToMeta({ Meta: [['key', 'value', ''], ['modelHash', 'abc123', '']] }))
+      .toEqual({ hash: 'abc123', problems: [], unreadableTabs: [] });
+  });
+});

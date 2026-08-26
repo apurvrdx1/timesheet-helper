@@ -108,6 +108,38 @@ export function isValidIsoMonth(raw: string): boolean {
 // cannot drift apart.
 // ---------------------------------------------------------------------------
 
+/**
+ * Drops trailing empty cells that sit BEYOND the expected width, and never
+ * any further.
+ *
+ * Google's `getDataRange().getDisplayValues()` returns a rectangle sized to
+ * the sheet's USED RANGE, not to the table the app wrote: one stray note in
+ * a fifth column anywhere in the tab pads every row — the header included —
+ * with a trailing `''`. Rejecting a byte-perfect header because a cell three
+ * rows down was annotated is a false verdict, and since an unreadable tab is
+ * now frozen (never written to again), a false verdict silently strands
+ * every later edit to that tab.
+ *
+ * Only trailing BLANKS are dropped, and only past `width`: a real value in an
+ * extra column is still a genuine mismatch, a short row is left short, and a
+ * legitimately empty last column (`managerId`) is never trimmed away.
+ */
+function trimPadding(cells: readonly string[], width: number): string[] {
+  let end = cells.length;
+  while (end > width && cells[end - 1] === '') end -= 1;
+  return cells.slice(0, end);
+}
+
+/**
+ * Exact, order-sensitive header comparison — after used-range padding is
+ * removed. A renamed or reordered column is still a mismatch: guessing at
+ * what the user meant is how columns get silently transposed.
+ */
+function headerMatches(header: readonly string[], columns: readonly string[]): boolean {
+  const trimmed = trimPadding(header, columns.length);
+  return trimmed.length === columns.length && columns.every((c, i) => trimmed[i] === c);
+}
+
 function parseTab<T>(
   payload: Partial<SheetPayload>,
   tab: TabName,
@@ -120,9 +152,7 @@ function parseTab<T>(
   if (rows.length === 0) return [];
 
   const header = rows[0] ?? [];
-  const headerMatches =
-    header.length === columns.length && columns.every((c, i) => header[i] === c);
-  if (!headerMatches) {
+  if (!headerMatches(header, columns)) {
     problems.push(
       `${tab}: header row does not match expected columns [${columns.join(', ')}]; got [${header.join(', ')}]`,
     );
@@ -136,7 +166,7 @@ function parseTab<T>(
 
   const out: T[] = [];
   for (let i = 1; i < rows.length; i += 1) {
-    const row = rows[i] ?? [];
+    const row = trimPadding(rows[i] ?? [], columns.length);
     const item = parseRow(row, i + 1, problems);
     if (item !== undefined) out.push(item);
   }
@@ -579,9 +609,7 @@ export function rowsToMeta(
   if (rows.length === 0) return { hash: null, problems, unreadableTabs };
 
   const header = rows[0] ?? [];
-  const headerMatches =
-    header.length === META_COLUMNS.length && META_COLUMNS.every((c, i) => header[i] === c);
-  if (!headerMatches) {
+  if (!headerMatches(header, META_COLUMNS)) {
     problems.push(
       `Meta: header row does not match expected columns [${META_COLUMNS.join(', ')}]; got [${header.join(', ')}]`,
     );
@@ -589,7 +617,7 @@ export function rowsToMeta(
   }
 
   for (let i = 1; i < rows.length; i += 1) {
-    const row = rows[i] ?? [];
+    const row = trimPadding(rows[i] ?? [], META_COLUMNS.length);
     if (row.length !== META_COLUMNS.length) {
       problems.push(`Meta row ${i + 1}: expected ${META_COLUMNS.length} columns, got ${row.length}`);
       continue;
