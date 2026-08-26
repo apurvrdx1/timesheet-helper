@@ -327,6 +327,30 @@ describe('useStore: a tab that failed to parse is never overwritten', () => {
     // The schedule is stale at the same time — the two must not compete.
     expect(result.current.isStale).toBe(true);
   });
+
+  // N2(b): the generic wording is unactionable — it is said about headers
+  // that look byte-perfect on screen. The discriminating detail already
+  // exists in `problems`; it went only to console.warn.
+  it('names the expected columns and the ones actually found', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    expect(result.current.dataNotice).toMatch(/expected columns \[id, name, role, managerId\]/);
+    expect(result.current.dataNotice).toMatch(/got \[id, name, Role, managerId\]/);
+  });
+
+  // N2(c): "will not write over it" reads as pure protection and hides the
+  // other half — the user's own edits to that tab are going nowhere.
+  it('says the user\u2019s own changes to the tab are not being saved either', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    expect(result.current.dataNotice).toMatch(/your changes to that tab are NOT being saved/i);
+  });
 });
 
 describe('useStore: the Schedule tab is never cleared by a result nobody computed', () => {

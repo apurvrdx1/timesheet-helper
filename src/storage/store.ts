@@ -138,23 +138,54 @@ function listTabs(tabs: readonly TabName[]): string {
 }
 
 /**
- * Names the constraint and the next action (DESIGN.md §4): which tab the
- * app could not read, why, and what stops the data from being lost while
- * the header stays broken.
+ * The expected-vs-got detail behind an unreadable tab, lifted out of
+ * `problems`.
+ *
+ * "The header row does not match the columns the app expects" is
+ * unactionable on its own — for the whole family of near-miss headers it is
+ * said about a header that looks byte-perfect on screen. The discriminating
+ * fact (which column is wrong, or that there is a stray extra one) is
+ * already computed in `parseTab`; it just never left the console.
  */
-function dataNoticeFor(unreadableTabs: readonly TabName[], problemCount: number): string | null {
+function headerDetailFor(
+  unreadableTabs: readonly TabName[],
+  problems: readonly string[],
+): string {
+  const details = problems.filter((problem) =>
+    unreadableTabs.some((tab) => problem.startsWith(`${tab}: header row`)),
+  );
+  return details.length === 0 ? '' : `${details.join(' ')}. `;
+}
+
+/**
+ * Names the constraint and the next action (DESIGN.md §4): which tab the
+ * app could not read, exactly how its header differs from the expected one,
+ * and BOTH consequences — the app will not write over it, and the user's own
+ * edits to it are not reaching the backend either.
+ *
+ * Saying only "the app will not write over it" reads as pure protection and
+ * hides the second half: while the tab is frozen, every edit the user makes
+ * to it is being kept locally and nowhere else.
+ */
+function dataNoticeFor(
+  unreadableTabs: readonly TabName[],
+  problems: readonly string[],
+): string | null {
   if (unreadableTabs.length > 0) {
     const isPlural = unreadableTabs.length > 1;
     const subject = `${listTabs(unreadableTabs)} ${isPlural ? 'tabs' : 'tab'}`;
     const pronoun = isPlural ? 'them' : 'it';
+    const changes = isPlural ? 'those tabs' : 'that tab';
     return (
       `The ${subject} could not be read: the header row does not match the columns the app expects. ` +
-      `Nothing from ${pronoun} was loaded, and the app will not write over ${pronoun}. ` +
+      `${headerDetailFor(unreadableTabs, problems)}` +
+      `Nothing from ${pronoun} was loaded, and the app will not write over ${pronoun} — ` +
+      `which also means your changes to ${changes} are NOT being saved to the backend until the header is fixed. ` +
       `Restore the header row in your spreadsheet, then reload this page.`
     );
   }
-  if (problemCount > 0) {
-    return `Loaded with ${problemCount} problem(s) in the backend's data — see the console for detail.`;
+  if (problems.length > 0) {
+    return `Loaded with ${problems.length} problem(s) in the backend's data — see the console for detail.`;
   }
   return null;
 }
@@ -262,7 +293,7 @@ export function useStore(): StoreApi {
         setStatus('idle');
 
         setNotice(null);
-        setDataNotice(dataNoticeFor(unreadable, problems.length));
+        setDataNotice(dataNoticeFor(unreadable, problems));
         if (problems.length > 0) {
           // eslint-disable-next-line no-console
           console.warn('Problems loading from backend:', problems);
