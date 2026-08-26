@@ -3,6 +3,7 @@ import { monthOf } from './calendar';
 import { opexFloor } from './capacity';
 import type { DemandItem } from './demand';
 import { keyOf } from './demand';
+import { cmp } from './order';
 import {
   BLOCKS_PER_DAY,
   type Blocks, type EntrySource, type IsoDate, type Override, type OtlCode,
@@ -81,7 +82,7 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
   let overriddenCapex = 0;
   let overriddenOther = 0;
   const sortedOverrides = [...overrides].sort((a, b) =>
-    a.date.localeCompare(b.date) || a.otlProjectCode.localeCompare(b.otlProjectCode));
+    cmp(a.date, b.date) || cmp(a.otlProjectCode, b.otlProjectCode));
 
   for (const o of sortedOverrides) {
     if (leaveDates.has(o.date)) {
@@ -194,6 +195,6 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
   // (date, otlProjectCode) is unique per person after the merge in `place`,
   // so this comparator is a total order and needs no further tiebreaker.
   entries.sort((a, b) =>
-    a.date.localeCompare(b.date) || a.otlProjectCode.localeCompare(b.otlProjectCode));
+    cmp(a.date, b.date) || cmp(a.otlProjectCode, b.otlProjectCode));
   return { entries, consumed, violations };
 }

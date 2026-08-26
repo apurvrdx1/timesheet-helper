@@ -2,6 +2,7 @@ import { hoursToBlocks } from './blocks';
 import { monthOf, weekDays, weeksTouchingMonth } from './calendar';
 import { leaveDatesFor } from './capacity';
 import { assignmentBlocks, keyOf, pacedDemand, parseKey, type DemandItem } from './demand';
+import { cmp } from './order';
 import { scheduleWeek } from './optimizer';
 import type {
   Blocks, IsoDate, IsoMonth, Model, PersonId, Residual, ScheduleEntry,
@@ -73,7 +74,7 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
   const manager = model.people.find((p) => p.role === 'MANAGER');
   const reports = model.people
     .filter((p) => p.role === 'REPORT')
-    .sort((a, b) => a.id.localeCompare(b.id));   // stable ordering
+    .sort((a, b) => cmp(a.id, b.id));   // stable ordering
 
   const entries: ScheduleEntry[] = [];
   const violations: Violation[] = [];
@@ -133,11 +134,11 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
   }
 
   entries.sort((a, b) =>
-    a.personId.localeCompare(b.personId) ||
-    a.date.localeCompare(b.date) ||
-    a.otlProjectCode.localeCompare(b.otlProjectCode));
+    cmp(a.personId, b.personId) ||
+    cmp(a.date, b.date) ||
+    cmp(a.otlProjectCode, b.otlProjectCode));
   residuals.sort((a, b) =>
-    a.month.localeCompare(b.month) || a.otlProjectCode.localeCompare(b.otlProjectCode));
+    cmp(a.month, b.month) || cmp(a.otlProjectCode, b.otlProjectCode));
 
   return { entries, residuals, violations };
 }

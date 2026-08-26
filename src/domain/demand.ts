@@ -1,4 +1,5 @@
 import { hoursToBlocks } from './blocks';
+import { cmp } from './order';
 import type { Blocks, IsoDate, IsoMonth, Model, OtlCode, PersonId } from './types';
 
 export interface DemandItem {
@@ -71,7 +72,7 @@ export function pacedDemand(
   // Stable: biggest first, then alphabetical. Never rely on Map iteration order.
   items.sort((a, b) =>
     b.blocks - a.blocks ||
-    a.otlProjectCode.localeCompare(b.otlProjectCode) ||
-    a.month.localeCompare(b.month));
+    cmp(a.otlProjectCode, b.otlProjectCode) ||
+    cmp(a.month, b.month));
   return items;
 }
