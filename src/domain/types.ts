@@ -63,7 +63,21 @@ export interface ScheduleEntry {
   date: IsoDate;
   otlProjectCode: OtlCode;
   blocks: Blocks;
+  /**
+   * What the UI should do with the cell. `OVERRIDE` means "lock this"; it
+   * does NOT mean every block in the cell came from the user. Use
+   * `overrideBlocks` for that question.
+   */
   source: EntrySource;
+  /**
+   * How many of `blocks` the user pinned by hand, 0 when none. Never greater
+   * than `blocks`. This is the only field that means "user input"; `source`
+   * survives a merge and so speaks for the whole cell, which is why the two
+   * had to be split. After a pinned cell became untouchable in phase 3 the
+   * two can differ in exactly one place: the default OPEX code, which phase 4
+   * may still have to top up so the day can reach 7.5h.
+   */
+  overrideBlocks: Blocks;
 }
 
 export interface Residual {

@@ -61,15 +61,21 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
     date: IsoDate, otlProjectCode: OtlCode, blocks: Blocks, source: EntrySource,
   ): void => {
     if (blocks <= 0) return;
+    // Phase 2 is the only caller that places user input, and it places exactly
+    // what the user pinned, so the two stay in lockstep by construction.
+    const overrideBlocks = source === 'OVERRIDE' ? blocks : 0;
     const cellKey = `${date}|${otlProjectCode}`;
     const existing = cells.get(cellKey);
     if (existing === undefined) {
-      cells.set(cellKey, { personId, date, otlProjectCode, blocks, source });
+      cells.set(cellKey, {
+        personId, date, otlProjectCode, blocks, source, overrideBlocks,
+      });
       return;
     }
     cells.set(cellKey, {
       ...existing,
       blocks: existing.blocks + blocks,
+      overrideBlocks: existing.overrideBlocks + overrideBlocks,
       source: SOURCE_RANK[source] > SOURCE_RANK[existing.source] ? source : existing.source,
     });
   };

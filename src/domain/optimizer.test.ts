@@ -148,6 +148,20 @@ describe('scheduleWeek', () => {
       .toBe(JSON.stringify(scheduleWeek(args).entries));
   });
 
+  it('records user input in overrideBlocks and leaves it at 0 elsewhere', () => {
+    const out = scheduleWeek(input({
+      overrides: [{ personId: 'p1', date: '2026-09-08', otlProjectCode: 'P-1002', hours: 4 }],
+      demand: [{ otlProjectCode: 'P-1001', month: '2026-09', blocks: 20 }],
+    }));
+    const pinned = out.entries.find(
+      (e) => e.date === '2026-09-08' && e.otlProjectCode === 'P-1002');
+    expect(pinned).toMatchObject({ blocks: 8, overrideBlocks: 8, source: 'OVERRIDE' });
+    for (const e of out.entries) {
+      expect(e.overrideBlocks).toBeLessThanOrEqual(e.blocks);
+      if (e.source !== 'OVERRIDE') expect(e.overrideBlocks).toBe(0);
+    }
+  });
+
   it('emits no zero-block entries', () => {
     const out = scheduleWeek(input({
       demand: [{ otlProjectCode: 'P-1001', month: '2026-09', blocks: 1 }],
@@ -222,7 +236,7 @@ describe('scheduleWeek', () => {
       expect(out.entries.filter((e) => e.date === '2026-09-09'))
         .toEqual([{
           personId: 'p1', date: '2026-09-09', otlProjectCode: 'VAC-01',
-          blocks: 15, source: 'LEAVE',
+          blocks: 15, source: 'LEAVE', overrideBlocks: 0,
         }]);
     });
 
