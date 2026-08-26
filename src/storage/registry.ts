@@ -41,9 +41,11 @@ export function listAdapters(): StorageAdapter[] {
 
 export interface ConnectionField {
   /** Which `BackendConfig` property this field edits. */
-  key: 'location' | 'secret' | 'clientId';
+  key: 'location' | 'secret' | 'clientId' | 'authority';
   label: string;
   type: 'text' | 'password';
+  /** Helper text shown between the label and the input, if any. */
+  description?: string;
 }
 
 export interface ConnectionNotice {
@@ -61,6 +63,12 @@ const CONNECTION_FIELDS: Record<BackendId, ConnectionField[]> = {
   microsoft: [
     { key: 'clientId', label: 'Client id', type: 'text' },
     { key: 'location', label: 'Workbook link', type: 'text' },
+    {
+      key: 'authority', label: 'Authority', type: 'text',
+      description:
+        'Valid values: common, consumers, organizations, or a tenant ID. Leave blank to use ' +
+        'common. A work or school account may need its tenant ID here to sign in.',
+    },
   ],
 };
 

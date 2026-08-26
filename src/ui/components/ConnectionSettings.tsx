@@ -106,6 +106,7 @@ export function ConnectionSettings({
                   key={field.key}
                   type={field.type}
                   label={field.label}
+                  description={field.description}
                   value={config[field.key] ?? ''}
                   onChange={(value) => handleFieldChange(field.key, value)}
                 />

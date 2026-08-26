@@ -62,7 +62,7 @@ describe('registry: connection fields', () => {
   it('gives every field a config key that round-trips through BackendConfig', () => {
     for (const adapter of listAdapters()) {
       for (const field of getConnectionFields(adapter.id)) {
-        expect(['location', 'secret', 'clientId']).toContain(field.key);
+        expect(['location', 'secret', 'clientId', 'authority']).toContain(field.key);
       }
     }
   });
