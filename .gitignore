@@ -4,6 +4,7 @@ dist/
 coverage/
 playwright-report/
 test-results/
+.playwright-mcp/
 .env
 .env.local
 .DS_Store
