@@ -71,6 +71,26 @@ function messageOf(error: unknown): string {
 }
 
 /**
+ * Whether two configs point at the SAME stored copy of the data — the same
+ * backend and the same location within it.
+ *
+ * `unreadableTabs` is evidence about one specific spreadsheet, gathered by
+ * reading it. It says nothing about a different one, which has not been read
+ * at all. Carrying the verdict across meant the intuitive escape hatch from a
+ * broken header ("connect somewhere clean") silently did not work: the new
+ * sheet received seven of eight tabs for the rest of the session, and the
+ * banner told the user to fix a header in a spreadsheet they had just left.
+ *
+ * Reconnecting to the SAME target is the one case where the evidence still
+ * holds. `connect` writes, it never re-reads, so clearing the verdict there
+ * would push the app's own (empty, because the tab did not load) rows over
+ * the very data the protection exists for.
+ */
+function isSameBackendTarget(a: BackendConfig, b: BackendConfig): boolean {
+  return a.backend === b.backend && a.location === b.location;
+}
+
+/**
  * True when the model plainly implies the schedule has content — there are
  * people, and something to place against their days. An empty
  * `ScheduleResult` for such a model means "nothing has been calculated
@@ -169,6 +189,18 @@ export function useStore(): StoreApi {
   unreadableTabsRef.current = unreadableTabs;
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * Drops the "these tabs did not parse" verdict and the notice built from
+   * it. The ref is written directly as well as the state: a push already
+   * queued on the debounce timer reads `unreadableTabsRef.current`, and it
+   * must not use a verdict about a backend the store has just left.
+   */
+  const forgetUnreadableTabs = useCallback((): void => {
+    unreadableTabsRef.current = [];
+    setUnreadableTabs([]);
+    setDataNotice(null);
+  }, []);
 
   const pushToAdapter = useCallback(
     async (pushModel: Model, entries: ScheduleResult['entries'], hash: string | null) => {
@@ -324,6 +356,12 @@ export function useStore(): StoreApi {
 
   const connect = useCallback(async (newConfig: BackendConfig): Promise<void> => {
     setStatus('syncing');
+    // A verdict gathered by reading the OLD spreadsheet must not be applied
+    // to a different one. Moving to a new target starts with no evidence
+    // against it, so every tab is pushed; reconnecting to the same target
+    // keeps the protection, because `connect` writes without re-reading.
+    const isSameTarget = isSameBackendTarget(configRef.current, newConfig);
+    const protectedTabs = isSameTarget ? unreadableTabsRef.current : [];
     try {
       const adapter = getAdapter(newConfig.backend);
       await adapter.connect(newConfig);
@@ -340,19 +378,20 @@ export function useStore(): StoreApi {
           currentModel,
           entries,
           hash,
-          tabsToProtect(currentModel, entries, unreadableTabsRef.current),
+          tabsToProtect(currentModel, entries, protectedTabs),
         ),
       );
 
       setConfig(newConfig);
       saveCache(currentModel, hash, newConfig);
+      if (!isSameTarget) forgetUnreadableTabs();
       setStatus('idle');
       setNotice(null);
     } catch (error) {
       setStatus('error');
       setNotice(`Could not connect: ${messageOf(error)}.`);
     }
-  }, []);
+  }, [forgetUnreadableTabs]);
 
   const disconnect = useCallback(async (): Promise<void> => {
     const adapter = getAdapter(configRef.current.backend);
@@ -362,11 +401,15 @@ export function useStore(): StoreApi {
       setNotice(`The backend did not disconnect cleanly: ${messageOf(error)}.`);
     } finally {
       const fallback: BackendConfig = { backend: 'local', location: '' };
+      const isSameTarget = isSameBackendTarget(configRef.current, fallback);
       setConfig(fallback);
       saveCache(modelRef.current, hashRef.current ?? '', fallback);
+      // Same rule as `connect`: the local-only store is a different copy of
+      // the data from the cloud sheet just left, and it has not been read.
+      if (!isSameTarget) forgetUnreadableTabs();
       setStatus('idle');
     }
-  }, []);
+  }, [forgetUnreadableTabs]);
 
   return {
     model,

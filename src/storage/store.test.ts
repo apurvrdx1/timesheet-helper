@@ -379,3 +379,101 @@ describe('useStore: the Schedule tab is never cleared by a result nobody compute
     expect(result.current.result.entries.length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// N1 regression: `unreadableTabs` was only ever SET (in loadInitial) and
+// never cleared, so a verdict about the old spreadsheet followed the user to
+// a new one. "Connect somewhere clean" is the intuitive escape hatch from a
+// broken header, and it silently did not work.
+// ---------------------------------------------------------------------------
+
+describe('useStore: an unreadable verdict does not follow the user to another backend', () => {
+  it('pushes every tab to a newly connected backend, including the one that was unreadable', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+
+    // A different target: same adapter, a location it has never read.
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: 'a-fresh-workbook' });
+    });
+
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed).toBeDefined();
+    expect(pushed && 'People' in pushed).toBe(true);
+    expect(result.current.unreadableTabs).toEqual([]);
+    expect(result.current.dataNotice).toBeNull();
+  });
+
+  it('keeps pushing the formerly-unreadable tab on every later push, not just the connect one', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: 'a-fresh-workbook' });
+    });
+
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'People' in pushed).toBe(true);
+  });
+
+  it('still protects the tab when reconnecting to the very same target', async () => {
+    // `connect` writes without re-reading, so the evidence about THIS sheet
+    // still stands — clearing it here would push the app's own empty People
+    // list over the rows the protection exists for.
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: '' });
+    });
+
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'People' in pushed).toBe(false);
+    expect(result.current.unreadableTabs).toEqual(['People']);
+    expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
+  });
+
+  it('clears the verdict on disconnect, which lands on a different store', async () => {
+    // Mounted against a named workbook; disconnect drops back to the
+    // unnamed local-only store, which is a different copy of the data and
+    // has not been read.
+    const connected: BackendConfig = { backend: 'local', location: 'a-named-workbook' };
+    saveCache(withOneAllocation(), 'cached-hash', connected);
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.unreadableTabs).toEqual(['People']);
+    expect(result.current.dataNotice).not.toBeNull();
+
+    await act(async () => {
+      await result.current.disconnect();
+    });
+
+    expect(result.current.unreadableTabs).toEqual([]);
+    expect(result.current.dataNotice).toBeNull();
+  });
+});
