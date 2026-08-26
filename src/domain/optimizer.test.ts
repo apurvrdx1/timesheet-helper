@@ -239,6 +239,33 @@ describe('scheduleWeek', () => {
       expect(dropped?.message).toContain('0.2');
     });
 
+    it('reports the hours an over-capacity override actually booked, not what it asked for', () => {
+      // Tuesday is already 7h pinned when the 1.2h override arrives, so only
+      // half an hour of it fits. The dropped-residual message is computed
+      // after placement, so it quotes 0.5h rather than the 1h it never booked.
+      const out = scheduleWeek(input({
+        overrides: [
+          { personId: 'p1', date: '2026-09-08', otlProjectCode: 'A-FILLER', hours: 7 },
+          { personId: 'p1', date: '2026-09-08', otlProjectCode: 'P-1001', hours: 1.2 },
+        ],
+      }));
+      expect(out.entries.find((e) => e.otlProjectCode === 'P-1001')?.blocks).toBe(1);
+      const dropped = out.violations.find((v) => v.kind === 'OVERRIDE_RESIDUAL_DROPPED');
+      expect(dropped?.message).toContain('booked 0.5h');
+      expect(dropped?.message).not.toContain('booked 1h');
+    });
+
+    it('does not report a zero-hour override on a leave day, because nothing was lost', () => {
+      const out = scheduleWeek(input({
+        leaveDates: new Map([['2026-09-09', 'VAC-01']]),
+        overrides: [
+          { personId: 'p1', date: '2026-09-09', otlProjectCode: 'P-1001', hours: 0 },
+          { personId: 'p1', date: '2026-09-09', otlProjectCode: 'P-1002', hours: -3 },
+        ],
+      }));
+      expect(out.violations.some((v) => v.kind === 'OVERRIDE_ON_LEAVE_DAY')).toBe(false);
+    });
+
     it('reports an override too small to fill a single block', () => {
       const out = scheduleWeek(input({
         overrides: [{

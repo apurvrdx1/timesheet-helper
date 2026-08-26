@@ -30,6 +30,18 @@ export interface WeekOutput {
  * Which source label survives when two bookings merge into one cell. A cell
  * the user touched must keep reading as user-set, because the UI locks on
  * that flag.
+ *
+ * The LEAVE rung is inert in practice: a leave day is set to zero remaining
+ * capacity in phase 1, and phases 2, 3 and 4 all skip a day with no room
+ * left, so no LEAVE cell can ever be merged into. It is ranked above CALC
+ * only for completeness.
+ *
+ * Note the ordering is deliberate rather than arbitrary. If a merge onto a
+ * leave day ever did become reachable, OVERRIDE > LEAVE would be actively
+ * wrong: the day would still hold 15 blocks of leave, but the cell would stop
+ * reading as leave and the "a leave day holds exactly one LEAVE entry"
+ * invariant would start failing. Any change that makes leave days mergeable
+ * must revisit this table, not just this comment.
  */
 const SOURCE_RANK: Record<EntrySource, number> = { CALC: 0, LEAVE: 1, OVERRIDE: 2 };
 
@@ -81,44 +93,57 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
   //    against the CAPEX ceiling in phase 3, whichever code it landed on.
   let overriddenCapex = 0;
   let overriddenOther = 0;
+  /** Cells the user pinned, as `date|otlProjectCode`. Phase 3 must not add to them. */
+  const overriddenCells = new Set<string>();
   const sortedOverrides = [...overrides].sort((a, b) =>
     cmp(a.date, b.date) || cmp(a.otlProjectCode, b.otlProjectCode));
 
   for (const o of sortedOverrides) {
+    const { blocks, residualHours } = hoursToBlocks(o.hours);
+
     if (leaveDates.has(o.date)) {
       // A leave day cannot hold anything else. Nothing vanishes silently:
-      // the override is reported rather than dropped on the floor.
-      violations.push({
-        personId, scope: o.date, kind: 'OVERRIDE_ON_LEAVE_DAY',
-        message: `${o.date} is a leave day, so the ${o.hours}h override on ` +
-                 `${o.otlProjectCode} could not be placed.`,
-      });
+      // the override is reported rather than dropped on the floor. A zero-
+      // or negative-hour override had nothing to lose, so it is not reported:
+      // claiming hours could not be placed when there were none is noise.
+      if (blocks > 0) {
+        violations.push({
+          personId, scope: o.date, kind: 'OVERRIDE_ON_LEAVE_DAY',
+          message: `${o.date} is a leave day, so the ${o.hours}h override on ` +
+                   `${o.otlProjectCode} could not be placed.`,
+        });
+      }
       continue;
     }
 
-    const { blocks, residualHours } = hoursToBlocks(o.hours);
+    let placed = 0;
+    if (blocks > 0) {
+      const left = dayRemaining.get(o.date) ?? 0;
+      if (blocks > left) {
+        violations.push({
+          personId, scope: o.date, kind: 'OVER_CAPACITY',
+          message: `Overrides on ${o.date} exceed 7.5h.`,
+        });
+      }
+      placed = Math.min(blocks, left);
+    }
+
+    // Reported after the placement, never before: the message quotes what was
+    // actually booked, so it can no longer claim hours the day had no room for.
     if (residualHours > 0) {
       violations.push({
         personId, scope: o.date, kind: 'OVERRIDE_RESIDUAL_DROPPED',
         message: `The ${o.hours}h override on ${o.otlProjectCode} on ${o.date} ` +
-                 `booked ${blocksToHours(blocks)}h; ${residualHours}h does not ` +
+                 `booked ${blocksToHours(placed)}h; ${residualHours}h does not ` +
                  `fit a half-hour block and was dropped.`,
       });
     }
-    if (blocks <= 0) continue;
 
-    const left = dayRemaining.get(o.date) ?? 0;
-    if (blocks > left) {
-      violations.push({
-        personId, scope: o.date, kind: 'OVER_CAPACITY',
-        message: `Overrides on ${o.date} exceed 7.5h.`,
-      });
-    }
-    const placed = Math.min(blocks, left);
     if (placed <= 0) continue;
 
     place(o.date, o.otlProjectCode, placed, 'OVERRIDE');
-    dayRemaining.set(o.date, left - placed);
+    overriddenCells.add(`${o.date}|${o.otlProjectCode}`);
+    dayRemaining.set(o.date, (dayRemaining.get(o.date) ?? 0) - placed);
 
     if (capexCodes.has(o.otlProjectCode)) {
       overriddenCapex += placed;
