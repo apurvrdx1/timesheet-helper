@@ -199,7 +199,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
 export function App() {
   const {
-    model, isStale, status, notice, dataNotice, unreadableTabs,
+    model, isStale, needsAllocation, status, notice, dataNotice, unreadableTabs,
     update, cancelPendingPush, recalculate, config, connect,
   } = useStore();
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
@@ -224,12 +224,18 @@ export function App() {
   // this adapts one shape to the other in exactly one place.
   const applyModel = useCallback((next: Model) => update(() => next), [update]);
 
+  // A model with no allocated month has nothing for `recalculate` to place,
+  // so Recalculate is not offered for it — a primary action that can only
+  // fail is worse than no action. The missing allocation is an empty state,
+  // named where it can be acted on (AllocationsPage), not a stale schedule.
+  const canRecalculate = isStale && !needsAllocation;
+
   const bannerPlan = planNoticeBanner({
     dataNotice,
     hasUnreadableTab: unreadableTabs.length > 0,
     notice,
     status,
-    staleReason: isStale ? STALE_REASON : null,
+    staleReason: canRecalculate ? STALE_REASON : null,
   });
 
   return (
@@ -267,14 +273,14 @@ export function App() {
                   description={bannerPlan.description}
                   collapsible={false}
                   endContent={
-                    isStale ? (
+                    canRecalculate ? (
                       <Button label="Recalculate" variant="primary" onClick={recalculate} />
                     ) : undefined
                   }
                 />
               ) : (
                 <StaleBanner
-                  isStale={isStale}
+                  isStale={canRecalculate}
                   reason={STALE_REASON}
                   onRecalculate={recalculate}
                 />

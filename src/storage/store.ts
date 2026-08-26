@@ -44,6 +44,20 @@ export interface StoreApi {
    * with nothing.
    */
   unreadableTabs: readonly TabName[];
+  /**
+   * True when the model expects a schedule but has no allocated month to
+   * build one over — people plus leave or an override, and nothing allocated
+   * yet, which is a natural first step.
+   *
+   * `recalculate` schedules over `monthsOf(model)`, derived from ALLOCATIONS
+   * ONLY, so such a model can only ever place nothing. Reported as staleness
+   * that was a permanent nag: the banner said the schedule was out of date,
+   * the one primary action attached to it failed every time it was pressed,
+   * and no `Meta` was ever written, so a reload reproduced it exactly. It is
+   * an EMPTY STATE, not a failed action — the UI names the missing
+   * allocation instead of offering an action that cannot succeed.
+   */
+  needsAllocation: boolean;
   update: (fn: (model: Model) => Model) => void;
   /**
    * Drops a push that `update` has queued on the debounce timer but not yet
@@ -149,6 +163,16 @@ function impliesSchedule(model: Model): boolean {
     model.people.length > 0 &&
     (model.allocations.length > 0 || model.leave.length > 0 || model.overrides.length > 0)
   );
+}
+
+/**
+ * True when the model implies a schedule but there is no allocated month to
+ * build one over. `monthsOf` is derived from ALLOCATIONS ONLY, so this is the
+ * CAUSE behind "the recalculation placed nothing" for a model that plainly
+ * has a schedule — and the only one that names an action the user can take.
+ */
+function hasNoAllocatedMonths(model: Model): boolean {
+  return impliesSchedule(model) && monthsOf(model).length === 0;
 }
 
 /**
@@ -444,13 +468,17 @@ export function useStore(): StoreApi {
       return;
     }
 
-    // A recalculation that placed nothing for a model that plainly has a
-    // schedule did not succeed — it ran over an empty window of months and
-    // computed over zero weeks. Recording its hash would clear the stale
-    // banner and certify a Schedule tab nobody wrote. Report it the same
-    // non-blocking way a scheduling failure is reported, and leave the
-    // model exactly as it was: still stale, still recoverable.
-    if (newResult.entries.length === 0 && impliesSchedule(currentModel)) {
+    // Gate on the CAUSE, not on the symptom. "It placed nothing" was the
+    // symptom; the cause is an empty window of months, and the message names
+    // exactly that, so it must only be said when that is what is missing.
+    // Recording the hash here would clear the stale banner and certify a
+    // Schedule tab nobody wrote.
+    //
+    // The UI does not offer Recalculate in this state at all — see
+    // `needsAllocation`, which reports it as the empty state it is rather
+    // than as staleness with a primary action that can only fail. This
+    // remains the guard behind that.
+    if (hasNoAllocatedMonths(currentModel)) {
       setNotice(
         'Could not recalculate: nothing could be scheduled, because the model has no ' +
         'allocated months to place hours into. Add an allocation on the Allocations tab ' +
@@ -548,6 +576,7 @@ export function useStore(): StoreApi {
     result,
     config,
     isStale: hashModel(model) !== lastCalculatedHash,
+    needsAllocation: hasNoAllocatedMonths(model),
     status,
     notice,
     dataNotice,

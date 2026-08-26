@@ -391,3 +391,59 @@ describe('App: a skipped row is an informational notice, not a red error', () =>
     consoleWarn.mockRestore();
   });
 });
+
+// ---------------------------------------------------------------------------
+// N3 regression: a model with people and an override but nothing allocated
+// has no month for `recalculate` to schedule over, so the recalculation
+// placed nothing every time and never recorded a hash. The banner stayed up
+// for the whole session, its one primary action failed on every press, and
+// nothing was written to make it stop — while the Weeks page rendered a full
+// schedule on screen. An empty scheduling window is an empty state.
+// ---------------------------------------------------------------------------
+
+/** People and an override, and not one allocated month. */
+const NOTHING_ALLOCATED = {
+  OTLs: [
+    ['projectCode', 'taskCode', 'expenditureTypeCode', 'timeReportingCode', 'category', 'leaveSubtype', 'isDefaultOpex', 'colorIndex', 'active'],
+    ['OPEX-ADMIN', 'T0', 'E0', 'R0', 'OPEX', '', 'TRUE', '1', 'TRUE'],
+  ],
+  People: [['id', 'name', 'role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
+  Overrides: [['personId', 'date', 'otlProjectCode', 'hours'], ['p1', '2026-09-07', 'OPEX-ADMIN', '7.5']],
+};
+
+describe('App: no allocated month is an empty state, not a permanent nag', () => {
+  it('offers no stale banner and no Recalculate action when there is no month to schedule over', async () => {
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(NOTHING_ALLOCATED));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.queryByText(/out of date/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /recalculate/i })).not.toBeInTheDocument();
+  });
+
+  it('names the missing allocation on the Allocations tab instead', async () => {
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(NOTHING_ALLOCATED));
+
+    render(<App />);
+    await settle();
+    await openTab(/allocations/i);
+
+    expect(screen.getByText(/allocate hours to a month to see them scheduled/i)).toBeInTheDocument();
+  });
+
+  it('still offers Recalculate once a month has an allocation', async () => {
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify({
+      ...NOTHING_ALLOCATED,
+      Allocations: [
+        ['month', 'otlProjectCode', 'personId', 'hours'],
+        ['2026-09', 'OPEX-ADMIN', 'p1', '40'],
+      ],
+    }));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByRole('button', { name: /recalculate/i })).toBeInTheDocument();
+  });
+});

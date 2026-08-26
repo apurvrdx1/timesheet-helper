@@ -748,3 +748,61 @@ describe('useStore: cancelPendingPush', () => {
     }).not.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// N3 regression: `recalculate` refused to record a hash whenever a model that
+// implies a schedule placed nothing — which, for a model with people and
+// leave but nothing allocated, is EVERY time, because `monthsOf` is derived
+// from ALLOCATIONS ONLY. The result was a permanent nag: `isStale` stuck
+// true, a Recalculate button armed and failing on every press, and no `Meta`
+// ever written, so a reload reproduced it exactly. Meanwhile the Weeks page,
+// whose window is `monthsOf(model) ∪ {month}`, rendered a full schedule.
+//
+// An empty scheduling window is an EMPTY STATE. The store names the cause so
+// the UI can point at the missing allocation instead of offering an action
+// that can only fail.
+// ---------------------------------------------------------------------------
+
+describe('useStore: a model with no allocated month is an empty state, not a stale schedule', () => {
+  it('reports needsAllocation for people plus an override with nothing allocated', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.update(withOverridesButNoAllocations);
+    });
+
+    expect(result.current.needsAllocation).toBe(true);
+  });
+
+  it('stops reporting it as soon as one month has an allocation', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.update((model) => ({
+        ...withOverridesButNoAllocations(model),
+        allocations: [
+          { month: '2026-09', otlProjectCode: 'OPEX-ADMIN', personId: 'p1', hours: 40 },
+        ],
+      }));
+    });
+
+    expect(result.current.needsAllocation).toBe(false);
+  });
+
+  it('does not report it for a model that implies no schedule at all', async () => {
+    // A brand-new model is not waiting for an allocation — it has nothing at
+    // all, and recalculating it succeeds and clears the banner.
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    expect(result.current.needsAllocation).toBe(false);
+  });
+});

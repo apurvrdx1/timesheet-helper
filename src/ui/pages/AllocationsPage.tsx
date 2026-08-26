@@ -9,6 +9,8 @@
 import { Stack } from '@astryxdesign/core/Stack';
 import { Selector } from '@astryxdesign/core/Selector';
 import { Heading } from '@astryxdesign/core/Heading';
+import { VStack } from '@astryxdesign/core/VStack';
+import { Text } from '@astryxdesign/core/Text';
 import { AllocationGrid } from '../components/AllocationGrid';
 import type { Model, IsoMonth } from '../../domain/types';
 
@@ -52,7 +54,36 @@ function monthOptions(month: IsoMonth): { value: string; label: string }[] {
   return options;
 }
 
+/**
+ * The empty state for a model with people but nothing allocated in any month
+ * (DESIGN.md §4 "Empty states": the title is the next action).
+ *
+ * This is where the schedule's empty window is acted on. `recalculate`
+ * schedules over allocated months only, so until one month has hours there is
+ * nothing for it to place — which the app used to report as a permanently
+ * stale schedule with a Recalculate button that failed every time it was
+ * pressed. The state is named here, next to the grid that clears it, and the
+ * banner stays quiet.
+ *
+ * The grid is still rendered underneath: it is the thing the user has to type
+ * into, so an empty state that replaced it would take away the way out.
+ */
+function AllocationsEmptyState() {
+  return (
+    <VStack gap={2}>
+      <Text type="label">Allocate hours to a month to see them scheduled.</Text>
+      <Text type="supporting" color="secondary">
+        No hours are allocated in any month yet. Enter hours in the grid below for the
+        month you are planning — the schedule is built from allocated months only, so
+        nothing is placed until at least one month has hours.
+      </Text>
+    </VStack>
+  );
+}
+
 export function AllocationsPage({ model, month, update, onMonthChange }: AllocationsPageProps) {
+  const hasNothingAllocated = model.people.length > 0 && model.allocations.length === 0;
+
   return (
     <Stack gap={6}>
       <Heading level={2}>Allocations</Heading>
@@ -62,6 +93,7 @@ export function AllocationsPage({ model, month, update, onMonthChange }: Allocat
         value={month}
         onChange={onMonthChange}
       />
+      {hasNothingAllocated && <AllocationsEmptyState />}
       <AllocationGrid model={model} month={month} update={update} />
     </Stack>
   );

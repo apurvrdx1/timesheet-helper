@@ -57,6 +57,25 @@ describe('AllocationsPage', () => {
     expect(screen.getByText(/over capacity/i)).toBeInTheDocument();
   });
 
+  // N3: a model with people but nothing allocated in any month has no window
+  // for the schedule to be built over. That used to surface only as a stale
+  // banner whose Recalculate button failed on every press; it is an empty
+  // state, and it belongs here, where the user can act on it.
+  it('names the missing allocation as an empty state when nothing is allocated', () => {
+    render(<AllocationsPage model={model} month="2026-09" update={vi.fn()} onMonthChange={vi.fn()} />);
+    expect(screen.getByText(/allocate hours to a month to see them scheduled/i)).toBeInTheDocument();
+    // The grid stays underneath: it is the way out of the empty state.
+    expect(screen.getByLabelText(/Alex.*P-1001/i)).toBeInTheDocument();
+  });
+
+  it('drops the empty state once a month has an allocation', () => {
+    const allocated: Model = { ...model, allocations: [
+      { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 40 },
+    ] };
+    render(<AllocationsPage model={allocated} month="2026-09" update={vi.fn()} onMonthChange={vi.fn()} />);
+    expect(screen.queryByText(/allocate hours to a month/i)).not.toBeInTheDocument();
+  });
+
   it('excludes OPEX and Leave codes from the grid', () => {
     const withOpex: Model = { ...model, otls: [capex, {
       ...capex, projectCode: 'OPEX-ADMIN', category: 'OPEX', isDefaultOpex: true,
