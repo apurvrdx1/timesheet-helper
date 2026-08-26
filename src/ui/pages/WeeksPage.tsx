@@ -6,6 +6,12 @@
  * Scheduling runs on every render from `model` and `month` (scheduleAll is
  * pure and local-only per DESIGN.md §4 "Loading" — no spinner, no caching
  * needed for a computation that finishes in milliseconds).
+ *
+ * Two things the month picker must not do, both of which it once did:
+ * it must not narrow the schedule to the month on screen (spec §3.4: there
+ * is one continuous schedule and the picker is a window onto it, so a week
+ * reads the same from either month it touches), and it must not let a model
+ * the scheduler cannot yet make sense of throw out of a render.
  */
 import { useState } from 'react';
 import { Stack } from '@astryxdesign/core/Stack';
@@ -26,6 +32,7 @@ import { scheduleAll } from '../../domain/schedule';
 import { blocksToHours } from '../../domain/blocks';
 import type {
   IsoDate, IsoMonth, LeaveRange, Model, OtlCode, PersonId, Residual, ScheduleEntry,
+  ScheduleResult,
 } from '../../domain/types';
 
 export interface WeeksPageProps {
@@ -63,6 +70,69 @@ function monthOptions(month: IsoMonth): { value: string; label: string }[] {
     options.push({ value, label: monthLabel(value) });
   }
   return options;
+}
+
+const EMPTY_RESULT: ScheduleResult = { entries: [], residuals: [], violations: [] };
+
+/**
+ * The months the schedule must span. Every month the model allocates into —
+ * the same set `store.recalculate` schedules over (see `monthsOf` in
+ * store.ts, which this deliberately matches rather than narrows) — plus the
+ * month being looked at, so opening a month the model has no allocations for
+ * still renders its weeks.
+ *
+ * Passing just `[month]` is what broke spec §3.4: with only one month in the
+ * window, pacing sees a runway of only the days that month contributes to
+ * the weeks on screen, so a straddling week is filled from a budget that
+ * looks nearly exhausted and the same week reads differently depending on
+ * which side it is opened from. Everything the truncated window failed to
+ * place then re-surfaced as an UNABSORBED residual for a month that had a
+ * whole run of days left.
+ */
+function scheduleMonths(model: Model, month: IsoMonth): IsoMonth[] {
+  return [...new Set([...model.allocations.map((allocation) => allocation.month), month])].sort();
+}
+
+interface ScheduleProblem {
+  /** The next action, per DESIGN.md §4 "Empty states". */
+  title: string;
+  detail: string;
+}
+
+/**
+ * `scheduleAll` throws on a model it cannot make sense of — the reachable
+ * case being a person to schedule with no OTL flagged as the default OPEX
+ * code, which Setup allows (add a manager before flagging a code) and
+ * deleting that OTL re-creates. The precondition is checked here rather than
+ * only caught, so the page can name the missing setting instead of quoting a
+ * domain exception; the catch stays as a backstop, because a render is the
+ * one place a throw costs the user the whole app.
+ */
+function scheduleSafely(model: Model, month: IsoMonth): {
+  result: ScheduleResult; problem: ScheduleProblem | null;
+} {
+  if (model.people.length > 0 && !model.otls.some((otl) => otl.isDefaultOpex)) {
+    return {
+      result: EMPTY_RESULT,
+      problem: {
+        title: 'Flag an OPEX code as default to see a schedule.',
+        detail: 'Every day is filled to 7.5h with the default OPEX code, so no week ' +
+                'can be scheduled until one of the OPEX codes on Setup is flagged as ' +
+                'the default.',
+      },
+    };
+  }
+  try {
+    return { result: scheduleAll(model, scheduleMonths(model, month)), problem: null };
+  } catch (error) {
+    return {
+      result: EMPTY_RESULT,
+      problem: {
+        title: 'The schedule could not be built.',
+        detail: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
 }
 
 function upsertOverride(
@@ -120,7 +190,7 @@ export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProp
   const [viewing, setViewing] = useState<Viewing | null>(null);
 
   const weeks = weeksTouchingMonth(month);
-  const scheduleResult = scheduleAll(model, [month]);
+  const { result: scheduleResult, problem } = scheduleSafely(model, month);
   const leaveOtls = model.otls.filter((otl) => otl.category === 'LEAVE');
   const viewingPersonName = viewing
     ? (model.people.find((person) => person.id === viewing.personId)?.name ?? '')
@@ -155,19 +225,26 @@ export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProp
         </VStack>
       )}
 
-      <WeekAccordion
-        weeks={weeks}
-        model={model}
-        scheduleResult={scheduleResult}
-        onOverride={(personId, date, otlProjectCode, hours) =>
-          update(upsertOverride(model, personId, date, otlProjectCode, hours))
-        }
-        onRevert={(personId, date, otlProjectCode) =>
-          update(removeOverride(model, personId, date, otlProjectCode))
-        }
-        onClearOverrides={(weekDates) => update(clearOverridesForWeek(model, weekDates))}
-        onViewPerson={(personId, monday) => setViewing({ personId, monday })}
-      />
+      {problem !== null ? (
+        <VStack gap={2}>
+          <Text type="label">{problem.title}</Text>
+          <Text type="supporting" color="secondary">{problem.detail}</Text>
+        </VStack>
+      ) : (
+        <WeekAccordion
+          weeks={weeks}
+          model={model}
+          scheduleResult={scheduleResult}
+          onOverride={(personId, date, otlProjectCode, hours) =>
+            update(upsertOverride(model, personId, date, otlProjectCode, hours))
+          }
+          onRevert={(personId, date, otlProjectCode) =>
+            update(removeOverride(model, personId, date, otlProjectCode))
+          }
+          onClearOverrides={(weekDates) => update(clearOverridesForWeek(model, weekDates))}
+          onViewPerson={(personId, monday) => setViewing({ personId, monday })}
+        />
+      )}
 
       <LeaveDialog
         isOpen={isLeaveDialogOpen}
