@@ -302,6 +302,47 @@ describe('serialize: malformed field validation (never throws, always reports)',
     expect(model.otls).toEqual([]);
   });
 
+  it('rejects an OTLs header with columns in the wrong order, not just the wrong length', () => {
+    // Same length, same column names, but projectCode/taskCode swapped —
+    // exactly what dragging two columns in a spreadsheet produces. If this
+    // regressed to a length-only check, every OTL would silently load with
+    // its project code and task code transposed.
+    const { model, problems } = rowsToModel({
+      OTLs: [
+        [
+          'taskCode', 'projectCode', 'expenditureTypeCode', 'timeReportingCode',
+          'category', 'leaveSubtype', 'isDefaultOpex', 'colorIndex', 'active',
+        ],
+        ['P-1', 'T1', 'E1', 'R1', 'CAPEX', '', 'FALSE', '1', 'TRUE'],
+      ],
+      People: [
+        ['id', 'name', 'role', 'managerId'],
+        ['p1', 'Alex', 'REPORT', ''],
+      ],
+    });
+    expect(model.otls).toEqual([]);
+    expect(problems.some((p) => /OTLs: header row does not match expected columns/.test(p))).toBe(true);
+    // The whole OTLs tab is dropped, but the rest of the payload is unaffected.
+    expect(model.people).toEqual([{ id: 'p1', name: 'Alex', role: 'REPORT', managerId: null }]);
+  });
+
+  it('rejects an OTL row with more columns than the header, not just fewer', () => {
+    const { model, problems } = rowsToModel({
+      OTLs: [
+        [
+          'projectCode', 'taskCode', 'expenditureTypeCode', 'timeReportingCode',
+          'category', 'leaveSubtype', 'isDefaultOpex', 'colorIndex', 'active',
+        ],
+        ['P-1', 'T1', 'E1', 'R1', 'CAPEX', '', 'FALSE', '1', 'TRUE', 'EXTRA'],
+        ['P-2', 'T2', 'E2', 'R2', 'OPEX', '', 'TRUE', '2', 'TRUE'],
+      ],
+    });
+    expect(problems.some((p) => /OTLs row 2: expected 9 columns, got 10/.test(p))).toBe(true);
+    // Only the malformed row is skipped; the next valid row in the same tab still loads.
+    expect(model.otls).toHaveLength(1);
+    expect(model.otls[0]?.projectCode).toBe('P-2');
+  });
+
   it('rejects an OTL row with a missing projectCode', () => {
     const { model, problems } = rowsToModel({
       OTLs: [
