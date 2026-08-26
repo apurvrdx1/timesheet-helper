@@ -30,6 +30,7 @@ import { PersonWeekView } from '../components/PersonWeekView';
 import { weeksTouchingMonth, weekDays } from '../../domain/calendar';
 import { scheduleAll } from '../../domain/schedule';
 import { blocksToHours } from '../../domain/blocks';
+import { monthsOf } from '../../storage/store';
 import type {
   IsoDate, IsoMonth, LeaveRange, Model, OtlCode, PersonId, Residual, ScheduleEntry,
   ScheduleResult,
@@ -76,10 +77,9 @@ const EMPTY_RESULT: ScheduleResult = { entries: [], residuals: [], violations: [
 
 /**
  * The months the schedule must span. Every month the model allocates into —
- * the same set `store.recalculate` schedules over (see `monthsOf` in
- * store.ts, which this deliberately matches rather than narrows) — plus the
- * month being looked at, so opening a month the model has no allocations for
- * still renders its weeks.
+ * the same set `store.recalculate` schedules over, via the shared
+ * `monthsOf` — plus the month being looked at, so opening a month the model
+ * has no allocations for still renders its weeks.
  *
  * Passing just `[month]` is what broke spec §3.4: with only one month in the
  * window, pacing sees a runway of only the days that month contributes to
@@ -90,7 +90,7 @@ const EMPTY_RESULT: ScheduleResult = { entries: [], residuals: [], violations: [
  * whole run of days left.
  */
 function scheduleMonths(model: Model, month: IsoMonth): IsoMonth[] {
-  return [...new Set([...model.allocations.map((allocation) => allocation.month), month])].sort();
+  return [...new Set([...monthsOf(model), month])].sort();
 }
 
 interface ScheduleProblem {

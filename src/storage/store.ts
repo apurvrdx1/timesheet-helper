@@ -61,7 +61,8 @@ const DEFAULT_CONFIG: BackendConfig = { backend: 'local', location: '' };
 
 const PUSH_DEBOUNCE_MS = 2000;
 
-function monthsOf(model: Model): IsoMonth[] {
+/** Every month the model allocates into, deduplicated and sorted. */
+export function monthsOf(model: Model): IsoMonth[] {
   return [...new Set(model.allocations.map((a) => a.month))].sort();
 }
 
