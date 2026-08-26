@@ -54,6 +54,21 @@ describe('googleAdapter.read', () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
     await expect(googleAdapter.read(config)).rejects.toThrow(/could not reach/i);
   });
+
+  it('explains the deployment access setting when Google answers with a login page', async () => {
+    // A deployment whose access is not "Anyone" returns an HTML sign-in
+    // page. `response.json()` then throws SyntaxError: Unexpected token
+    // '<', which used to be rendered to the user verbatim.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError("Unexpected token '<', \"<!DOCTYPE \"... is not valid JSON");
+      },
+    }));
+
+    await expect(googleAdapter.read(config)).rejects.toThrow(/anyone/i);
+    await expect(googleAdapter.read(config)).rejects.not.toThrow(/unexpected token/i);
+  });
 });
 
 describe('googleAdapter.write', () => {
