@@ -15,19 +15,42 @@ needs deploying — the React app talks to it over plain HTTP.
 
 ## 2. Set your own secret
 
-Open the pasted script and find this line near the top:
+The secret is **not** written into `Code.gs`. It lives in the script project's
+own Script Properties, and the script reads it from there:
 
-```javascript
-var SECRET = 'REPLACE_WITH_YOUR_SHARED_SECRET';
-```
+1. In the Apps Script editor, open **Project Settings** (the gear icon in the
+   left sidebar).
+2. Scroll to **Script properties** and click **Add script property**.
+3. **Property:** `SHARED_SECRET`
+   **Value:** a random string only you know (a password manager's "generate
+   password" feature works well).
+4. Click **Save script properties**.
 
-Replace `REPLACE_WITH_YOUR_SHARED_SECRET` with a random string only you know
-(a password manager's "generate password" feature works well). This secret is
-the only thing standing between your spreadsheet and anyone who finds the
-deployment URL, since the web app itself is deployed as publicly reachable —
+This is the same value you will type into Timesheet Helper's connection
+settings. It is the only thing standing between your spreadsheet and anyone who
+finds the deployment URL, since the web app is deployed as publicly reachable —
 treat it like a password.
 
+> **Never paste the secret into `Code.gs`.** This repository is public
+> (<https://github.com/apurvrdx1/timesheet-helper>). A secret typed into the
+> script file is one careless `git commit` away from being published, and
+> anyone who finds it can read and rewrite your timesheet Sheet.
+
+Two things this buys you beyond keeping the file safe to share:
+
+- **Rotation is immediate.** Change the property value, update Timesheet
+  Helper's settings, done — it applies to the very next request. A hardcoded
+  constant would need a fresh deployment version (step 4), which is the step
+  everyone forgets.
+- **Nothing sensitive is on screen.** You can share, screenshot or screen-share
+  the script editor without leaking anything; the property value is not part of
+  the code.
+
 Save the script (**File → Save**, or Cmd/Ctrl+S).
+
+If you skip this step, the script does not fail with "unauthorized" — it
+answers with an explicit message telling you the `SHARED_SECRET` script
+property has not been set and where to set it.
 
 ## 3. Deploy as a web app
 
@@ -39,8 +62,9 @@ Save the script (**File → Save**, or Cmd/Ctrl+S).
 4. Click **Deploy**, then authorize the script when Google prompts you.
 5. Copy the **Web app URL** — it looks like
    `https://script.google.com/macros/s/AKfycb.../exec`. This is the URL
-   (`location`) and the value you typed into `SECRET` (the `secret`) that you
-   will enter into Timesheet Helper's connection settings.
+   (`location`); together with the `SHARED_SECRET` value from step 2 (the
+   `secret`), it is what you enter into Timesheet Helper's connection
+   settings.
 
 ## 4. Redeploying after you edit the script
 
@@ -90,9 +114,13 @@ up before this change has unprotected headers until you push a new version.
 
 ## 6. Troubleshooting
 
-- **"unauthorized" errors:** the `secret` sent by the app doesn't match
-  `SECRET` in the script. Double-check you copied it exactly (no leading/
-  trailing spaces) into Timesheet Helper's settings.
+- **"This Apps Script has no shared secret set yet":** the `SHARED_SECRET`
+  script property is missing or empty. See step 2 — this is a setup step, not a
+  wrong secret. No redeployment is needed after setting it.
+- **"unauthorized" errors:** the `secret` sent by the app doesn't match the
+  `SHARED_SECRET` script property. Double-check you copied it exactly (no
+  leading/trailing spaces) into Timesheet Helper's settings. Changing the
+  property takes effect on the next request — no redeployment needed.
 - **Requests fail entirely / CORS-like errors:** confirm the deployment's
   "Who has access" is set to **Anyone**, and that you redeployed a **new
   version** after any script edit (see step 4).
