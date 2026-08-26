@@ -405,14 +405,40 @@ describe('useStore: the Schedule tab is never cleared by a result nobody compute
 });
 
 // ---------------------------------------------------------------------------
-// N1 regression: `unreadableTabs` was only ever SET (in loadInitial) and
-// never cleared, so a verdict about the old spreadsheet followed the user to
-// a new one. "Connect somewhere clean" is the intuitive escape hatch from a
-// broken header, and it silently did not work.
+// N1 regression, twice over.
+//
+// First: `unreadableTabs` was only ever SET (in loadInitial) and never
+// cleared, so a verdict about the old spreadsheet followed the user to a new
+// one. "Connect somewhere clean" is the intuitive escape hatch from a broken
+// header, and it silently did not work.
+//
+// Then the fix for THAT retired the verdict by comparing `backend` +
+// `location`. `location` is not target identity: the local adapter ignores it
+// entirely (one fixed key), a Microsoft share link for one workbook differs
+// textually run to run while Graph resolves them all to the same item, and a
+// new Apps Script deployment mints a new /exec URL for the same spreadsheet.
+// A false "different target" dropped the protection, and `connect` — which
+// clears each tab before writing it — then wrote the app's own EMPTY copy of
+// the unparseable tab over the user's rows. The verdict is now retired the
+// way it was produced: by READING the target being landed on.
+//
+// Every case below asserts on what SURVIVED in the store, not merely on which
+// keys were pushed. Checking what was sent rather than what is left is how
+// the destroying behaviour got through review.
 // ---------------------------------------------------------------------------
 
-describe('useStore: an unreadable verdict does not follow the user to another backend', () => {
-  it('pushes every tab to a newly connected backend, including the one that was unreadable', async () => {
+/**
+ * A target that really IS a different, empty one. `localOnlyAdapter` has a
+ * single fixed key, so "somewhere clean" can only be simulated at its `read`.
+ * `write` is left alone and still lands in the real localStorage, so the
+ * assertions below are about genuinely stored data.
+ */
+function readsAsAFreshTarget(): void {
+  vi.spyOn(localOnlyAdapter, 'read').mockResolvedValue({});
+}
+
+describe('useStore: an unreadable verdict is retired by a read, not by comparing config strings', () => {
+  it('leaves the unreadable tab intact when the new location merely looks different', async () => {
     storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
     const { result } = renderHook(() => useStore());
     await waitFor(() => expect(result.current.status).toBe('idle'));
@@ -422,15 +448,41 @@ describe('useStore: an unreadable verdict does not follow the user to another ba
       result.current.update(addAPerson);
     });
 
-    // A different target: same adapter, a location it has never read.
+    // A location string the app has never seen — and, because the local
+    // adapter ignores `location` altogether, the very same store.
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: 'looks-different-is-not' });
+    });
+
+    // What SURVIVED, not what was sent: Alex's row is still in the store.
+    expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'People' in pushed).toBe(false);
+    expect(result.current.unreadableTabs).toEqual(['People']);
+  });
+
+  it('clears the verdict and pushes every tab when the target landed on reads clean', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+
+    readsAsAFreshTarget();
     const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
     await act(async () => {
       await result.current.connect({ backend: 'local', location: 'a-fresh-workbook' });
     });
 
     const pushed = writeSpy.mock.calls[0]?.[1];
-    expect(pushed).toBeDefined();
     expect(pushed && 'People' in pushed).toBe(true);
+    // And the escape hatch actually worked: the tab now holds the app's
+    // people under the header the app expects.
+    expect(readLocalPayload().People?.[0]).toEqual(PEOPLE_HEADER);
     expect(result.current.unreadableTabs).toEqual([]);
     expect(result.current.dataNotice).toBeNull();
   });
@@ -444,6 +496,7 @@ describe('useStore: an unreadable verdict does not follow the user to another ba
     });
     expect(result.current.unreadableTabs).toEqual(['People']);
 
+    readsAsAFreshTarget();
     await act(async () => {
       await result.current.connect({ backend: 'local', location: 'a-fresh-workbook' });
     });
@@ -461,10 +514,31 @@ describe('useStore: an unreadable verdict does not follow the user to another ba
     expect(pushed && 'People' in pushed).toBe(true);
   });
 
+  it('keeps the verdict when the new target cannot be read at all', async () => {
+    // A read that fails is not evidence that the target is clean. Assuming
+    // it is, is what destroys data; keeping the protection only costs the
+    // user a tab that is not written, which is recoverable.
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    vi.spyOn(localOnlyAdapter, 'read').mockRejectedValue(new Error('target unreachable'));
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: 'unreadable-target' });
+    });
+
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'People' in pushed).toBe(false);
+    expect(result.current.unreadableTabs).toEqual(['People']);
+    expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
+  });
+
   it('still protects the tab when reconnecting to the very same target', async () => {
-    // `connect` writes without re-reading, so the evidence about THIS sheet
-    // still stands — clearing it here would push the app's own empty People
-    // list over the rows the protection exists for.
+    // Re-reading the same sheet returns the same broken header, so the
+    // evidence stands — clearing it here would push the app's own empty
+    // People list over the rows the protection exists for.
     storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
     const { result } = renderHook(() => useStore());
     await waitFor(() => expect(result.current.status).toBe('idle'));
@@ -480,10 +554,44 @@ describe('useStore: an unreadable verdict does not follow the user to another ba
     expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
   });
 
-  it('clears the verdict on disconnect, which lands on a different store', async () => {
-    // Mounted against a named workbook; disconnect drops back to the
-    // unnamed local-only store, which is a different copy of the data and
-    // has not been read.
+  it('keeps the verdict on disconnect, which lands on the very same local store', async () => {
+    // This case used to rest on a comment claiming disconnect "lands on a
+    // different store". It does not: `localOnlyAdapter` ignores `location`
+    // and has exactly one key, so disconnecting from a named local workbook
+    // lands on the same data — and `disconnect`'s fallback location is
+    // hardcoded `''`, so ANY non-empty location read as "different". The
+    // real UI reaches this routinely: the backend switcher carries the
+    // previous backend's location across a backend change.
+    const connected: BackendConfig = { backend: 'local', location: 'a-named-workbook' };
+    saveCache(withOneAllocation(), 'cached-hash', connected);
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    await act(async () => {
+      await result.current.disconnect();
+    });
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'People' in pushed).toBe(false);
+    expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
+  });
+
+  it('clears the verdict on disconnect when the store it lands on reads clean', async () => {
     const connected: BackendConfig = { backend: 'local', location: 'a-named-workbook' };
     saveCache(withOneAllocation(), 'cached-hash', connected);
     storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
@@ -493,6 +601,7 @@ describe('useStore: an unreadable verdict does not follow the user to another ba
     expect(result.current.unreadableTabs).toEqual(['People']);
     expect(result.current.dataNotice).not.toBeNull();
 
+    readsAsAFreshTarget();
     await act(async () => {
       await result.current.disconnect();
     });

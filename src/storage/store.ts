@@ -78,23 +78,63 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * Whether two configs point at the SAME stored copy of the data — the same
- * backend and the same location within it.
- *
- * `unreadableTabs` is evidence about one specific spreadsheet, gathered by
- * reading it. It says nothing about a different one, which has not been read
- * at all. Carrying the verdict across meant the intuitive escape hatch from a
- * broken header ("connect somewhere clean") silently did not work: the new
- * sheet received seven of eight tabs for the rest of the session, and the
- * banner told the user to fix a header in a spreadsheet they had just left.
- *
- * Reconnecting to the SAME target is the one case where the evidence still
- * holds. `connect` writes, it never re-reads, so clearing the verdict there
- * would push the app's own (empty, because the tab did not load) rows over
- * the very data the protection exists for.
+ * What a read of one target says about it: which tabs could not be parsed,
+ * and the detail behind that.
  */
-function isSameBackendTarget(a: BackendConfig, b: BackendConfig): boolean {
-  return a.backend === b.backend && a.location === b.location;
+interface ReadVerdict {
+  unreadableTabs: readonly TabName[];
+  problems: readonly string[];
+}
+
+/**
+ * Re-derives the unreadable-tab verdict by READING the target being moved to.
+ *
+ * `unreadableTabs` is evidence about one specific stored copy of the data,
+ * produced by reading it. It says nothing about a different copy, and
+ * carrying it across meant the intuitive escape hatch from a broken header
+ * ("connect somewhere clean") silently did not work. But the previous
+ * attempt at retiring it compared `backend` + `location` and treated a
+ * difference as proof of a different target — and `location` IS NOT TARGET
+ * IDENTITY. Every adapter maps it many-to-one:
+ *
+ * - the local adapter ignores it entirely; there is one fixed key, so every
+ *   local location string names the same store;
+ * - a Microsoft share link for one workbook differs textually run to run
+ *   (the `?e=` token, `:x:/g/` vs `Doc.aspx?sourcedoc=`) while Graph
+ *   resolves them all to the same driveItem;
+ * - a NEW Apps Script deployment mints a new /exec URL for the SAME bound
+ *   spreadsheet.
+ *
+ * The comparison was wrong in the unsafe direction: a false "different
+ * target" dropped the protection, and `connect` then blind-wrote the app's
+ * own copy of the tab it could not parse — EMPTY, precisely because it could
+ * not be parsed — over the user's rows, which both cloud writers clear before
+ * writing. A read is what produced the verdict, so a read is what retires it.
+ *
+ * The payload is used for NOTHING but this verdict. `connect` writes and
+ * never reads the model; replacing the in-memory model here would clobber
+ * exactly the unsaved local edits that "write, never read" exists to keep.
+ *
+ * `null` means the target could not be read at all — which is not evidence
+ * that it is clean, and callers must not treat it as such.
+ */
+async function readVerdict(config: BackendConfig): Promise<ReadVerdict | null> {
+  try {
+    const payload = await getAdapter(config.backend).read(config);
+    const model_ = rowsToModel(payload);
+    const schedule_ = rowsToScheduleEntries(payload);
+    const meta_ = rowsToMeta(payload);
+    return {
+      unreadableTabs: [
+        ...model_.unreadableTabs,
+        ...schedule_.unreadableTabs,
+        ...meta_.unreadableTabs,
+      ],
+      problems: [...model_.problems, ...schedule_.problems, ...meta_.problems],
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -238,15 +278,26 @@ export function useStore(): StoreApi {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /**
-   * Drops the "these tabs did not parse" verdict and the notice built from
-   * it. The ref is written directly as well as the state: a push already
-   * queued on the debounce timer reads `unreadableTabsRef.current`, and it
-   * must not use a verdict about a backend the store has just left.
+   * Replaces the "these tabs did not parse" verdict with one freshly read
+   * off the target the store is landing on. The ref is written directly as
+   * well as the state: a push already queued on the debounce timer reads
+   * `unreadableTabsRef.current`, and it must not use a verdict about a
+   * backend the store has just left.
+   *
+   * Rows that merely failed to parse are deliberately NOT reported here.
+   * `connect` immediately writes the in-memory model over every tab it is
+   * not protecting, so a malformed row in a readable tab is about to be
+   * replaced; only a tab that could not be read at all still has something
+   * to say.
    */
-  const forgetUnreadableTabs = useCallback((): void => {
-    unreadableTabsRef.current = [];
-    setUnreadableTabs([]);
-    setDataNotice(null);
+  const adoptVerdict = useCallback((verdict: ReadVerdict): void => {
+    unreadableTabsRef.current = verdict.unreadableTabs;
+    setUnreadableTabs(verdict.unreadableTabs);
+    setDataNotice(
+      verdict.unreadableTabs.length > 0
+        ? dataNoticeFor(verdict.unreadableTabs, verdict.problems)
+        : null,
+    );
   }, []);
 
   const pushToAdapter = useCallback(
@@ -425,15 +476,22 @@ export function useStore(): StoreApi {
 
   const connect = useCallback(async (newConfig: BackendConfig): Promise<void> => {
     setStatus('syncing');
-    // A verdict gathered by reading the OLD spreadsheet must not be applied
-    // to a different one. Moving to a new target starts with no evidence
-    // against it, so every tab is pushed; reconnecting to the same target
-    // keeps the protection, because `connect` writes without re-reading.
-    const isSameTarget = isSameBackendTarget(configRef.current, newConfig);
-    const protectedTabs = isSameTarget ? unreadableTabsRef.current : [];
     try {
       const adapter = getAdapter(newConfig.backend);
       await adapter.connect(newConfig);
+
+      // Which tabs this push must leave alone is decided by what the target
+      // being connected to ACTUALLY holds, never by whether its config
+      // strings look different from the last one's. The read runs after
+      // `adapter.connect` because that is where interactive sign-in happens,
+      // and its payload is used for nothing but the verdict.
+      //
+      // A read that fails says nothing about the target — least of all that
+      // it is clean. The standing verdict is kept in that case: at worst a
+      // tab is not written, which is recoverable; assuming a target we could
+      // not read is clean is what is not.
+      const verdict = await readVerdict(newConfig);
+      const protectedTabs = verdict?.unreadableTabs ?? unreadableTabsRef.current;
 
       // Switching backends must not lose data: write the in-memory model to
       // the newly selected backend rather than reading it and possibly
@@ -453,14 +511,14 @@ export function useStore(): StoreApi {
 
       setConfig(newConfig);
       saveCache(currentModel, hash, newConfig);
-      if (!isSameTarget) forgetUnreadableTabs();
+      if (verdict !== null) adoptVerdict(verdict);
       setStatus('idle');
       setNotice(null);
     } catch (error) {
       setStatus('error');
       setNotice(`Could not connect: ${messageOf(error)}.`);
     }
-  }, [forgetUnreadableTabs]);
+  }, [adoptVerdict]);
 
   const disconnect = useCallback(async (): Promise<void> => {
     const adapter = getAdapter(configRef.current.backend);
@@ -470,15 +528,20 @@ export function useStore(): StoreApi {
       setNotice(`The backend did not disconnect cleanly: ${messageOf(error)}.`);
     } finally {
       const fallback: BackendConfig = { backend: 'local', location: '' };
-      const isSameTarget = isSameBackendTarget(configRef.current, fallback);
       setConfig(fallback);
       saveCache(modelRef.current, hashRef.current ?? '', fallback);
-      // Same rule as `connect`: the local-only store is a different copy of
-      // the data from the cloud sheet just left, and it has not been read.
-      if (!isSameTarget) forgetUnreadableTabs();
+      // Same rule as `connect`, for the same reason: only a read of the copy
+      // being landed on can retire a verdict gathered from the copy being
+      // left. Comparing configs got this wrong in both directions — the
+      // fallback's location is hardcoded `''`, so ANY non-empty location
+      // (including one the backend switcher carried over from a previous
+      // backend) read as "a different store" and dropped the protection,
+      // while the local-only adapter has exactly one store regardless.
+      const verdict = await readVerdict(fallback);
+      if (verdict !== null) adoptVerdict(verdict);
       setStatus('idle');
     }
-  }, [forgetUnreadableTabs]);
+  }, [adoptVerdict]);
 
   return {
     model,
