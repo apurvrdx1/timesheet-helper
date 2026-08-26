@@ -1,12 +1,9 @@
 /**
  * The application shell: theme root, page header, primary navigation, the
- * recalculation banner, and the per-tab content area. Task 16 wires the
- * shell and nav only — each tab's real content (the OTL/person setup
- * table, the allocation grid, the week accordions) belongs to later tasks
- * and is stood in for here with a DESIGN.md-compliant empty state that
- * names the next action rather than the absence of data.
+ * recalculation banner, and the per-tab content area. Each tab renders its
+ * real page — SetupPage, AllocationsPage, WeeksPage — wired to `useStore()`.
  */
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Theme } from '@astryxdesign/core/theme';
 import { neutralTheme } from '@astryxdesign/theme-neutral/built';
 import { Section } from '@astryxdesign/core/Section';
@@ -16,10 +13,13 @@ import { Heading } from '@astryxdesign/core/Heading';
 import { Button } from '@astryxdesign/core/Button';
 import { Banner } from '@astryxdesign/core/Banner';
 import { TabList, Tab } from '@astryxdesign/core/TabList';
-import { EmptyState } from '@astryxdesign/core/EmptyState';
 import { StaleBanner } from './components/StaleBanner';
 import { ConnectionSettings } from './components/ConnectionSettings';
+import { SetupPage } from './pages/SetupPage';
+import { AllocationsPage } from './pages/AllocationsPage';
+import { WeeksPage } from './pages/WeeksPage';
 import { useStore } from '../storage/store';
+import type { IsoMonth, Model } from '../domain/types';
 
 type TabValue = 'setup' | 'allocations' | 'weeks';
 
@@ -27,19 +27,20 @@ function isTabValue(value: string): value is TabValue {
   return value === 'setup' || value === 'allocations' || value === 'weeks';
 }
 
-const TABS: ReadonlyArray<{ value: TabValue; label: string; emptyTitle: string }> = [
-  { value: 'setup', label: 'Setup', emptyTitle: 'Add your first OTL to start allocating hours.' },
-  {
-    value: 'allocations',
-    label: 'Allocations',
-    emptyTitle: 'Add an OTL and a report to start allocating hours.',
-  },
-  {
-    value: 'weeks',
-    label: 'Weeks',
-    emptyTitle: 'Weeks appear here once hours are allocated and recalculated.',
-  },
+const TABS: ReadonlyArray<{ value: TabValue; label: string }> = [
+  { value: 'setup', label: 'Setup' },
+  { value: 'allocations', label: 'Allocations' },
+  { value: 'weeks', label: 'Weeks' },
 ];
+
+/** Today's month, in the UI layer only — src/domain/ forbids `new Date()`
+ * for determinism, but the app still needs a real, current default when it
+ * first opens. Local time is fine here: this only ever seeds the initial
+ * `Selector` value, which the user can change immediately. */
+function currentMonth(): IsoMonth {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
 
 /** Names what went stale. The store tracks staleness as a boolean (a model
  * hash mismatch) rather than a specific field diff, so the reason is
@@ -47,7 +48,7 @@ const TABS: ReadonlyArray<{ value: TabValue; label: string; emptyTitle: string }
 const STALE_REASON = 'The schedule changed since the last recalculation — results are out of date.';
 
 export function App() {
-  const { model, isStale, status, notice, recalculate, config, connect } = useStore();
+  const { model, isStale, status, notice, update, recalculate, config, connect } = useStore();
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   // ConnectionSettings is a controlled form: it reports edits via `onChange`
@@ -56,13 +57,19 @@ export function App() {
   // in-progress edit, seeded from the store's committed config each time the
   // dialog opens, so cancelling never touches the real connection.
   const [draftConfig, setDraftConfig] = useState(config);
-
-  const activeEmptyTitle = TABS.find((tab) => tab.value === activeTab)?.emptyTitle ?? '';
+  // Held here, not per-page, so switching tabs (Allocations ↔ Weeks) keeps
+  // the manager's place instead of resetting to the current month.
+  const [month, setMonth] = useState<IsoMonth>(() => currentMonth());
 
   const openConnectionSettings = (): void => {
     setDraftConfig(config);
     setIsSettingsOpen(true);
   };
+
+  // AllocationsPage/WeeksPage take `update` as "apply this whole next
+  // model" — the store's `update` takes an updater function instead, so
+  // this adapts one shape to the other in exactly one place.
+  const applyModel = useCallback((next: Model) => update(() => next), [update]);
 
   return (
     <Theme theme={neutralTheme}>
@@ -107,7 +114,13 @@ export function App() {
                   <Tab key={tab.value} value={tab.value} label={tab.label} />
                 ))}
               </TabList>
-              <EmptyState title={activeEmptyTitle} description={`${model.otls.length} OTL(s) configured.`} />
+              {activeTab === 'setup' && <SetupPage model={model} update={update} />}
+              {activeTab === 'allocations' && (
+                <AllocationsPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
+              )}
+              {activeTab === 'weeks' && (
+                <WeeksPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
+              )}
             </LayoutContent>
           }
         />

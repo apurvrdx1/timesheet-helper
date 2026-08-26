@@ -184,7 +184,21 @@ export function useStore(): StoreApi {
 
   const recalculate = useCallback(() => {
     const currentModel = modelRef.current;
-    const newResult = scheduleAll(currentModel, monthsOf(currentModel));
+    // `scheduleAll` throws on a model the scheduler can't yet make sense of
+    // (no OTL flagged as the default OPEX code is the reachable case: a
+    // manager exists but Setup hasn't gotten an OTL yet). Recalculation is
+    // the app's one primary action (DESIGN.md §5 rule 7) and reachable the
+    // moment any tab renders — an uncaught throw here would take the whole
+    // app down for a data problem the model itself already tolerates.
+    // Never a crash: report it the same non-blocking way a failed sync does
+    // and leave the model exactly as it was, still stale, still recoverable.
+    let newResult: ScheduleResult;
+    try {
+      newResult = scheduleAll(currentModel, monthsOf(currentModel));
+    } catch (error) {
+      setNotice(`Could not recalculate: ${messageOf(error)}.`);
+      return;
+    }
     const hash = hashModel(currentModel);
 
     setResult(newResult);

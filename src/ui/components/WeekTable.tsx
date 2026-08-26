@@ -10,12 +10,15 @@
  * identifier columns get `position: sticky` by hand here — the one other
  * hand-rolled layout bit in this file, called out per DESIGN.md §5 rule 1.
  */
-import { Fragment, type CSSProperties } from 'react';
+import { Fragment, type CSSProperties, type SVGProps } from 'react';
 import {
   Table, TableHeader, TableBody, TableRow, TableCell, TableHeaderCell,
 } from '@astryxdesign/core/Table';
 import { Text } from '@astryxdesign/core/Text';
 import { Code } from '@astryxdesign/core/Code';
+import { HStack } from '@astryxdesign/core/HStack';
+import { IconButton } from '@astryxdesign/core/IconButton';
+import { Icon } from '@astryxdesign/core/Icon';
 import { HourCell } from './HourCell';
 import { blocksToHours } from '../../domain/blocks';
 import { formatDayHeader } from '../../domain/calendar';
@@ -34,6 +37,20 @@ export interface WeekTableProps {
   otls: Otl[];
   onOverride: (personId: PersonId, date: IsoDate, otlProjectCode: OtlCode, hours: number) => void;
   onRevert: (personId: PersonId, date: IsoDate, otlProjectCode: OtlCode) => void;
+  /** Opens the read-only PersonWeekView for this person and week (task 21). */
+  onViewPerson: (personId: PersonId) => void;
+}
+
+/** No "view"/"eye" name exists in the Astryx icon registry — the same
+ * situation HourCell's lock glyph documents — so a minimal eye glyph is
+ * supplied directly rather than repurposing an unrelated registry icon. */
+function ViewGlyph(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" {...props}>
+      <path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5Z" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="8" cy="8" r="2" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
 }
 
 /** DESIGN.md §2.1's named ramp (blue, orange, purple, green, pink, cyan, red,
@@ -76,7 +93,9 @@ function otlLookup(otls: Otl[], code: OtlCode): Otl | undefined {
   return otls.find((otl) => otl.projectCode === code);
 }
 
-export function WeekTable({ title, people, dates, entries, otls, onOverride, onRevert }: WeekTableProps) {
+export function WeekTable({
+  title, people, dates, entries, otls, onOverride, onRevert, onViewPerson,
+}: WeekTableProps) {
   return (
     <div style={{ overflowX: 'auto' }}>
       <Table aria-label={title} density="balanced" dividers="rows">
@@ -104,7 +123,17 @@ export function WeekTable({ title, people, dates, entries, otls, onOverride, onR
                 {codes.length === 0 && (
                   <TableRow style={isNewPersonBlock ? EMPHASIZED : undefined}>
                     <TableCell colSpan={4} style={stickyStyle(0)}>
-                      <Text type="label">{person.name}</Text>
+                      <HStack gap={2} vAlign="center">
+                        <Text type="label">{person.name}</Text>
+                        <IconButton
+                          label={`View ${person.name}'s week`}
+                          tooltip={`View ${person.name}'s week`}
+                          icon={<Icon icon={ViewGlyph} />}
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => onViewPerson(person.id)}
+                        />
+                      </HStack>
                     </TableCell>
                     <TableCell colSpan={dates.length}>
                       <Text type="supporting" color="disabled">No hours scheduled this week.</Text>
@@ -157,7 +186,17 @@ export function WeekTable({ title, people, dates, entries, otls, onOverride, onR
                 {codes.length > 0 && (
                   <TableRow>
                     <TableCell colSpan={4} style={stickyStyle(0)}>
-                      <Text type="label">{`${person.name} total`}</Text>
+                      <HStack gap={2} vAlign="center">
+                        <Text type="label">{`${person.name} total`}</Text>
+                        <IconButton
+                          label={`View ${person.name}'s week`}
+                          tooltip={`View ${person.name}'s week`}
+                          icon={<Icon icon={ViewGlyph} />}
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => onViewPerson(person.id)}
+                        />
+                      </HStack>
                     </TableCell>
                     {dates.map((date) => {
                       const total = personEntries

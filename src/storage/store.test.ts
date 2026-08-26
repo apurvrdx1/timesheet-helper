@@ -169,6 +169,32 @@ describe('useStore: recalculate', () => {
     await waitFor(() => expect(result.current.isStale).toBe(false));
     expect(result.current.result.entries).toEqual([]);
   });
+
+  it('reports a scheduling failure as a notice instead of throwing, leaving the model stale', async () => {
+    // scheduleAll throws when a person exists but no OTL is flagged as the
+    // default OPEX code — reachable the moment Setup has added a manager
+    // but not yet an OTL. Recalculate must never let that escape as an
+    // uncaught exception (the app's one primary action, reachable from
+    // every tab).
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    act(() => {
+      result.current.update((model) => ({
+        ...model,
+        people: [{ id: 'p1', name: 'Alex', role: 'REPORT', managerId: null }],
+      }));
+    });
+
+    expect(() => {
+      act(() => {
+        result.current.recalculate();
+      });
+    }).not.toThrow();
+
+    expect(result.current.isStale).toBe(true);
+    expect(result.current.notice).toMatch(/could not recalculate/i);
+  });
 });
 
 describe('useStore: connect/disconnect', () => {

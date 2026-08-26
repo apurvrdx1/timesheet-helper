@@ -32,6 +32,8 @@ export interface WeekAccordionProps {
   onOverride: (personId: PersonId, date: IsoDate, otlProjectCode: OtlCode, hours: number) => void;
   onRevert: (personId: PersonId, date: IsoDate, otlProjectCode: OtlCode) => void;
   onClearOverrides: (weekDates: IsoDate[]) => void;
+  /** Opens the read-only PersonWeekView for this person and the given week's Monday (task 21). */
+  onViewPerson: (personId: PersonId, monday: IsoDate) => void;
 }
 
 const STORAGE_KEY = 'timesheet-helper.weeksAccordion.open';
@@ -86,7 +88,7 @@ function weekCapacityHours(weekDates: IsoDate[], model: Model): number {
 }
 
 export function WeekAccordion({
-  weeks, model, scheduleResult, onOverride, onRevert, onClearOverrides,
+  weeks, model, scheduleResult, onOverride, onRevert, onClearOverrides, onViewPerson,
 }: WeekAccordionProps) {
   const [openWeeks, setOpenWeeks] = useState<string[]>(() => loadOpenWeeks());
   const [clearTarget, setClearTarget] = useState<IsoDate | null>(null);
@@ -161,6 +163,7 @@ export function WeekAccordion({
                     otls={model.otls}
                     onOverride={onOverride}
                     onRevert={onRevert}
+                    onViewPerson={(personId) => onViewPerson(personId, monday)}
                   />
                   <WeekTable
                     title="Reports"
@@ -170,6 +173,7 @@ export function WeekAccordion({
                     otls={model.otls}
                     onOverride={onOverride}
                     onRevert={onRevert}
+                    onViewPerson={(personId) => onViewPerson(personId, monday)}
                   />
                 </VStack>
               )}

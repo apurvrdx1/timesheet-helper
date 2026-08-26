@@ -16,13 +16,16 @@ import { Selector } from '@astryxdesign/core/Selector';
 import { Button } from '@astryxdesign/core/Button';
 import { Badge } from '@astryxdesign/core/Badge';
 import { Text } from '@astryxdesign/core/Text';
+import { Dialog, DialogHeader } from '@astryxdesign/core/Dialog';
+import { Layout, LayoutContent } from '@astryxdesign/core/Layout';
 import { WeekAccordion } from '../components/WeekAccordion';
 import { LeaveDialog } from '../components/LeaveDialog';
-import { weeksTouchingMonth } from '../../domain/calendar';
+import { PersonWeekView } from '../components/PersonWeekView';
+import { weeksTouchingMonth, weekDays } from '../../domain/calendar';
 import { scheduleAll } from '../../domain/schedule';
 import { blocksToHours } from '../../domain/blocks';
 import type {
-  IsoDate, IsoMonth, LeaveRange, Model, OtlCode, PersonId, Residual,
+  IsoDate, IsoMonth, LeaveRange, Model, OtlCode, PersonId, Residual, ScheduleEntry,
 } from '../../domain/types';
 
 export interface WeeksPageProps {
@@ -99,12 +102,29 @@ function residualHours(residual: Residual): number {
   return residual.blocks > 0 ? blocksToHours(residual.blocks) : (residual.subBlockHours ?? 0);
 }
 
+/** The one person's entries for the one week being read off (task 21) —
+ * the same "already filtered by the caller" contract PersonWeekView and
+ * WeekTable both rely on. */
+function entriesForPersonWeek(entries: ScheduleEntry[], personId: PersonId, monday: IsoDate): ScheduleEntry[] {
+  const dates = new Set(weekDays(monday));
+  return entries.filter((entry) => entry.personId === personId && dates.has(entry.date));
+}
+
+interface Viewing {
+  personId: PersonId;
+  monday: IsoDate;
+}
+
 export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProps) {
   const [isLeaveDialogOpen, setIsLeaveDialogOpen] = useState(false);
+  const [viewing, setViewing] = useState<Viewing | null>(null);
 
   const weeks = weeksTouchingMonth(month);
   const scheduleResult = scheduleAll(model, [month]);
   const leaveOtls = model.otls.filter((otl) => otl.category === 'LEAVE');
+  const viewingPersonName = viewing
+    ? (model.people.find((person) => person.id === viewing.personId)?.name ?? '')
+    : '';
 
   return (
     <Stack gap={6}>
@@ -146,6 +166,7 @@ export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProp
           update(removeOverride(model, personId, date, otlProjectCode))
         }
         onClearOverrides={(weekDates) => update(clearOverridesForWeek(model, weekDates))}
+        onViewPerson={(personId, monday) => setViewing({ personId, monday })}
       />
 
       <LeaveDialog
@@ -155,6 +176,42 @@ export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProp
         leaveOtls={leaveOtls}
         onSubmit={(leave) => update(addLeave(model, leave))}
       />
+
+      {/* A sibling of WeekAccordion, not a replacement for it: opening this
+          dialog never unmounts the accordion, so its open/closed weeks (and
+          their localStorage-backed state) are untouched — the user's place
+          in the accordion survives opening and closing the read-off view. */}
+      <Dialog
+        isOpen={viewing !== null}
+        onOpenChange={(open) => {
+          if (!open) setViewing(null);
+        }}
+        purpose="info"
+        width={960}
+      >
+        <Layout
+          header={
+            <DialogHeader
+              title={viewing ? `${viewingPersonName}'s week` : ''}
+              onOpenChange={(open) => {
+                if (!open) setViewing(null);
+              }}
+            />
+          }
+          content={
+            <LayoutContent>
+              {viewing && (
+                <PersonWeekView
+                  personName={viewingPersonName}
+                  monday={viewing.monday}
+                  entries={entriesForPersonWeek(scheduleResult.entries, viewing.personId, viewing.monday)}
+                  otls={model.otls}
+                />
+              )}
+            </LayoutContent>
+          }
+        />
+      </Dialog>
     </Stack>
   );
 }
