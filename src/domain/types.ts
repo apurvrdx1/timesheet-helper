@@ -89,7 +89,8 @@ export interface Residual {
 }
 
 export interface Violation {
-  personId: PersonId;
+  /** null for a violation about the model itself rather than about a person. */
+  personId: PersonId | null;
   scope: IsoDate | IsoMonth;
   kind:
     | 'DAY_NOT_FULL'
@@ -99,7 +100,13 @@ export interface Violation {
     /** An override landed on a day that leave had already claimed in full. */
     | 'OVERRIDE_ON_LEAVE_DAY'
     /** An override's hours did not divide into whole half-hour blocks. */
-    | 'OVERRIDE_RESIDUAL_DROPPED';
+    | 'OVERRIDE_RESIDUAL_DROPPED'
+    /** An allocation row's hours did not divide into whole half-hour blocks. */
+    | 'ALLOCATION_RESIDUAL_DROPPED'
+    /** The model has more than one MANAGER; only the first is a cascade target. */
+    | 'MULTIPLE_MANAGERS'
+    /** Placed + carried does not reconcile against the budget for a key. */
+    | 'HOURS_NOT_CONSERVED';
   message: string;
 }
 

@@ -1,4 +1,4 @@
-import { hoursToBlocks } from './blocks';
+import { blocksToHours, hoursToBlocks } from './blocks';
 import { monthOf, weekDays, weeksTouchingMonth } from './calendar';
 import { leaveDatesFor } from './capacity';
 import { assignmentBlocks, keyOf, pacedDemand, parseKey, type DemandItem } from './demand';
@@ -79,18 +79,58 @@ function schedulePerson(
 
 export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
   const weeks = allWeeks(months);
-  const manager = model.people.find((p) => p.role === 'MANAGER');
-  const reports = model.people
-    .filter((p) => p.role === 'REPORT')
-    .sort((a, b) => cmp(a.id, b.id));   // stable ordering
 
   const entries: ScheduleEntry[] = [];
   const violations: Violation[] = [];
   const residuals: Residual[] = [];
 
-  // 1. Reports first — they have first claim on their own assignments.
+  // Violations about the model rather than about a day need some scope; the
+  // first requested month is the most useful thing to point the UI at.
+  const modelScope: IsoMonth | IsoDate = months[0] ?? weeks[0] ?? '';
+
+  // Allocation rows are inputs at a system boundary. A value that is not a
+  // multiple of 0.5 cannot be represented as blocks, and truncating it in
+  // silence is the same defect class already fixed for overrides.
+  for (const a of model.allocations) {
+    const { blocks, residualHours } = hoursToBlocks(a.hours);
+    if (residualHours <= 0) continue;
+    const which = a.personId === null
+      ? 'monthly total' : `allocation for ${a.personId}`;
+    violations.push({
+      personId: a.personId, scope: a.month, kind: 'ALLOCATION_RESIDUAL_DROPPED',
+      message: `The ${a.hours}h ${which} on ${a.otlProjectCode} in ${a.month} ` +
+               `booked ${blocksToHours(blocks)}h; ${residualHours}h does not ` +
+               `fit a half-hour block and was dropped.`,
+    });
+  }
+
+  // Sorted by id, never by array order: the cascade target must not change
+  // just because the people rows arrived in a different sequence.
+  const people = [...model.people].sort((a, b) => cmp(a.id, b.id));
+  const managers = people.filter((p) => p.role === 'MANAGER');
+  const cascadeTarget = managers[0];
+
+  // The product rule is one manager per instance. A second one is a
+  // configuration error — but silently dropping a human being out of the
+  // timesheet is far worse than a warning, so every extra manager is
+  // scheduled like anybody else and the surplus is reported instead.
+  for (const extra of managers.slice(1)) {
+    violations.push({
+      personId: extra.id, scope: modelScope, kind: 'MULTIPLE_MANAGERS',
+      message: `The model has ${managers.length} people with the MANAGER role, ` +
+               `but exactly one is expected. ${cascadeTarget?.id ?? ''} is the ` +
+               `cascade target; ${extra.id} is scheduled with their own ` +
+               `assignments and floor only.`,
+    });
+  }
+
+  // 1. Everyone who is not the cascade target — reports, surplus managers, and
+  //    anyone carrying a role this code does not recognise. Filtering on role
+  //    would drop the rest of them from the schedule entirely.
+  const others = people.filter((p) => p !== cascadeTarget);
+
   const unabsorbed = new Map<string, Blocks>();
-  for (const person of reports) {
+  for (const person of others) {
     const remaining = assignmentBlocks(person.id, model);
     const result = schedulePerson(person.id, weeks, remaining, model);
     entries.push(...result.entries);
@@ -116,29 +156,42 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
     if (gap > 0) unassigned.set(key, gap);
   }
 
-  // 3. The manager takes their own assignments, then the leftovers.
-  if (manager) {
-    const remaining = assignmentBlocks(manager.id, model);
-    for (const source of [unabsorbed, unassigned]) {
-      for (const [key, blocks] of source) {
-        remaining.set(key, (remaining.get(key) ?? 0) + blocks);
-      }
+  const carried = new Map<string, Blocks>();
+  for (const pool of [unabsorbed, unassigned]) {
+    for (const [key, blocks] of pool) {
+      carried.set(key, (carried.get(key) ?? 0) + blocks);
     }
-    const result = schedulePerson(manager.id, weeks, remaining, model);
+  }
+
+  // 3. The cascade target takes their own assignments, then the leftovers.
+  //    With no manager in the model there is nobody to absorb them, so the
+  //    pools pass straight through to step 4 untouched.
+  let leftover = carried;
+  if (cascadeTarget) {
+    const remaining = assignmentBlocks(cascadeTarget.id, model);
+    for (const [key, blocks] of carried) {
+      remaining.set(key, (remaining.get(key) ?? 0) + blocks);
+    }
+    const result = schedulePerson(cascadeTarget.id, weeks, remaining, model);
     entries.push(...result.entries);
     violations.push(...result.violations);
+    leftover = remaining;
+  }
 
-    // 4. Whatever the manager could not take carries forward.
-    for (const [key, blocks] of remaining) {
-      if (blocks <= 0) continue;
-      const parsed = parseKey(key);
-      if (parsed === null) continue;
-      const { month, otlProjectCode } = parsed;
-      residuals.push({
-        personId: null, otlProjectCode, month, blocks,
-        reason: unassigned.has(key) ? 'UNASSIGNED' : 'UNABSORBED',
-      });
-    }
+  // 4. Whatever nobody could take carries forward. This runs unconditionally.
+  //    The headline invariant is that every hour is placed, carried forward,
+  //    or explicitly reported; a model with no manager is not an exemption
+  //    from it, and gating this block on a manager existing meant both pools
+  //    were computed and then thrown away without a trace.
+  for (const [key, blocks] of leftover) {
+    if (blocks <= 0) continue;
+    const parsed = parseKey(key);
+    if (parsed === null) continue;
+    const { month, otlProjectCode } = parsed;
+    residuals.push({
+      personId: null, otlProjectCode, month, blocks,
+      reason: unassigned.has(key) ? 'UNASSIGNED' : 'UNABSORBED',
+    });
   }
 
   entries.sort((a, b) =>
@@ -147,6 +200,13 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
     cmp(a.otlProjectCode, b.otlProjectCode));
   residuals.sort((a, b) =>
     cmp(a.month, b.month) || cmp(a.otlProjectCode, b.otlProjectCode));
+  // Violations are output too, and output has to be deterministic. Message is
+  // the last tiebreaker, so the order only ever ties for identical rows.
+  violations.sort((a, b) =>
+    cmp(a.personId ?? '', b.personId ?? '') ||
+    cmp(a.scope, b.scope) ||
+    cmp(a.kind, b.kind) ||
+    cmp(a.message, b.message));
 
   return { entries, residuals, violations };
 }
