@@ -252,11 +252,16 @@ export const microsoftAdapter: StorageAdapter = {
     return Object.fromEntries(entries) as Partial<SheetPayload>;
   },
 
-  async write(config: BackendConfig, payload: SheetPayload): Promise<void> {
+  async write(config: BackendConfig, payload: Partial<SheetPayload>): Promise<void> {
     const token = await acquireToken(config);
     const itemId = await getWorkbookId(token, config.location);
     for (const tab of TABS) {
-      await writeWorksheet(token, itemId, tab, payload[tab]);
+      const rows = payload[tab];
+      // `writeWorksheet` clears before it writes, so a tab the caller chose
+      // to omit must be skipped entirely — touching it would destroy the
+      // data the omission exists to protect.
+      if (rows === undefined) continue;
+      await writeWorksheet(token, itemId, tab, rows);
     }
   },
 };

@@ -27,3 +27,22 @@ describe('localOnlyAdapter', () => {
     Storage.prototype.getItem = original;
   });
 });
+
+describe('localOnlyAdapter.write: tabs the caller omits', () => {
+  it('leaves an omitted tab exactly as it was instead of dropping it', async () => {
+    await localOnlyAdapter.write(config, {
+      OTLs: [['projectCode'], ['P-1001']],
+      People: [['id', 'name', 'Role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
+    } as never);
+
+    // A later push that could not read People must not cost the user those
+    // rows — the same contract both cloud writers keep by not touching the
+    // tab at all.
+    await localOnlyAdapter.write(config, { OTLs: [['projectCode'], ['P-2002']] } as never);
+
+    expect(await localOnlyAdapter.read(config)).toEqual({
+      OTLs: [['projectCode'], ['P-2002']],
+      People: [['id', 'name', 'Role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
+    });
+  });
+});

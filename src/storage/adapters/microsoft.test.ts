@@ -292,6 +292,22 @@ describe('microsoftAdapter.read / write URL shapes', () => {
     expect(urls.some((u) => u.includes('usedRange/clear'))).toBe(false);
     expect(urls.some((u) => u.includes("worksheets('OTLs')/range(address='A1:A2')"))).toBe(true);
   });
+
+  it('never touches a tab the payload omits — the write clears before it writes', async () => {
+    const spy = stubFetch([
+      { match: /\/shares\//, respond: () => ok({ id: 'ITEM1' }) },
+      { match: /usedRange/, respond: () => ok({ address: 'Sheet1!A1:A1' }) },
+      { match: /\/clear$/, respond: () => ok({}) },
+      { match: /range\(address=/, respond: () => ok({}) },
+      { match: /\/worksheets$/, respond: () => ok({}) },
+    ]);
+
+    await microsoftAdapter.write(config, { OTLs: [['h'], ['1']] });
+
+    const urls = spy.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.includes("worksheets('OTLs')"))).toBe(true);
+    expect(urls.some((u) => u.includes("worksheets('People')"))).toBe(false);
+  });
 });
 
 describe('workbook id cache', () => {

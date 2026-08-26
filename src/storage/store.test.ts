@@ -230,3 +230,152 @@ describe('useStore: connect/disconnect', () => {
     expect(result.current.status).toBe('idle');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Data-loss regressions. Every case below reproduces a way the app used to
+// replace the user's spreadsheet data with nothing.
+// ---------------------------------------------------------------------------
+
+const OTL_HEADER = [
+  'projectCode', 'taskCode', 'expenditureTypeCode', 'timeReportingCode',
+  'category', 'leaveSubtype', 'isDefaultOpex', 'colorIndex', 'active',
+];
+const PEOPLE_HEADER = ['id', 'name', 'role', 'managerId'];
+const ALLOCATION_HEADER = ['month', 'otlProjectCode', 'personId', 'hours'];
+
+/** The hand-edit that triggers the whole family: one capital R in `role`. */
+const BROKEN_PEOPLE_HEADER = ['id', 'name', 'Role', 'managerId'];
+
+const PEOPLE_ROW = ['p1', 'Alex', 'MANAGER', ''];
+
+/** A payload the scheduler can actually place hours from. */
+function schedulablePayload(peopleHeader: string[]): Record<string, string[][]> {
+  return {
+    OTLs: [OTL_HEADER, ['OPEX-ADMIN', 'T0', 'E0', 'R0', 'OPEX', '', 'TRUE', '1', 'TRUE']],
+    People: [peopleHeader, PEOPLE_ROW],
+    Allocations: [ALLOCATION_HEADER, ['2026-09', 'OPEX-ADMIN', 'p1', '40']],
+  };
+}
+
+function storeLocalPayload(payload: Record<string, string[][]>): void {
+  localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(payload));
+}
+
+function readLocalPayload(): Record<string, string[][]> {
+  const raw = localStorage.getItem(LOCAL_ADAPTER_KEY);
+  return raw === null ? {} : (JSON.parse(raw) as Record<string, string[][]>);
+}
+
+const addAPerson = (model: Model): Model => ({
+  ...model,
+  people: [...model.people, { id: 'p2', name: 'Sam', role: 'REPORT', managerId: null }],
+});
+
+describe('useStore: a tab that failed to parse is never overwritten', () => {
+  it('omits the unreadable tab from the debounced push, leaving the backend copy intact', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    vi.useFakeTimers();
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    // The header mismatch drops the whole tab, exactly as before — guessing
+    // at column meaning would be worse.
+    expect(result.current.model.people).toEqual([]);
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed).toBeDefined();
+    expect(pushed && 'People' in pushed).toBe(false);
+    expect(pushed && 'OTLs' in pushed).toBe(true);
+
+    // And the backend still holds the user's rows — not a lone header row.
+    expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
+  });
+
+  it('keeps the good cached model instead of overwriting it with the lossy read', async () => {
+    const cachedModel = withOneAllocation();
+    saveCache(cachedModel, 'cached-hash', { backend: 'local', location: '' });
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    expect(loadCache()?.model).toEqual(cachedModel);
+  });
+
+  it('reports the unreadable tab as a data notice, separate from the sync notice', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    expect(result.current.dataNotice).toMatch(/People tab could not be read/i);
+    expect(result.current.dataNotice).toMatch(/will not write over it/i);
+    expect(result.current.notice).toBeNull();
+    // The schedule is stale at the same time — the two must not compete.
+    expect(result.current.isStale).toBe(true);
+  });
+});
+
+describe('useStore: the Schedule tab is never cleared by a result nobody computed', () => {
+  it('omits Schedule from the push when the model implies one but none is calculated', async () => {
+    // Model tabs load fine; the Schedule tab is absent, so `result` is empty
+    // while the model plainly implies a non-empty schedule.
+    storeLocalPayload(schedulablePayload(PEOPLE_HEADER));
+    vi.useFakeTimers();
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(result.current.model.people).toHaveLength(1);
+    expect(result.current.result.entries).toEqual([]);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'Schedule' in pushed).toBe(false);
+    expect(pushed && 'People' in pushed).toBe(true);
+  });
+
+  it('restores a result — not EMPTY_RESULT — when the backend is unreachable', async () => {
+    const cachedModel: Model = {
+      ...emptyModel,
+      otls: [{
+        projectCode: 'OPEX-ADMIN', taskCode: 'T0', expenditureTypeCode: 'E0',
+        timeReportingCode: 'R0', category: 'OPEX', leaveSubtype: null,
+        isDefaultOpex: true, colorIndex: 1, active: true,
+      }],
+      people: [{ id: 'p1', name: 'Alex', role: 'MANAGER', managerId: null }],
+      allocations: [{ month: '2026-09', otlProjectCode: 'OPEX-ADMIN', personId: 'p1', hours: 40 }],
+    };
+    const config: BackendConfig = {
+      backend: 'google', location: 'https://script.google.com/macros/s/abc/exec', secret: 's',
+    };
+    saveCache(cachedModel, 'cached-hash', config);
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network down'));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('offline'));
+
+    expect(result.current.result.entries.length).toBeGreaterThan(0);
+  });
+});

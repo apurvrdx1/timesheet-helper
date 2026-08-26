@@ -11,6 +11,7 @@ import type { BackendConfig } from './adapter';
 import { getAdapter } from './registry';
 import { loadCache, saveCache } from './localCache';
 import { rowsToModel, rowsToScheduleEntries, rowsToMeta, buildSheetPayload } from './serialize';
+import type { TabName } from './serialize';
 import { hashModel } from '../domain/hash';
 import { scheduleAll } from '../domain/schedule';
 import type { Model, ScheduleResult, IsoMonth } from '../domain/types';
@@ -29,6 +30,20 @@ export interface StoreApi {
    * say. Never a substitute for `status` — always paired with it.
    */
   notice: string | null;
+  /**
+   * A data-integrity notice about the last read: a tab whose header the app
+   * could not make sense of, or rows it had to skip. Separate from `notice`
+   * because it outranks a connectivity message and must never be suppressed
+   * behind one — the user's spreadsheet holds data the app cannot see, and
+   * only the user can fix that. `null` when the last read was clean.
+   */
+  dataNotice: string | null;
+  /**
+   * The tabs that failed to parse on the last read. Every push omits them,
+   * so unreadable data stays exactly where it is instead of being replaced
+   * with nothing.
+   */
+  unreadableTabs: readonly TabName[];
   update: (fn: (model: Model) => Model) => void;
   recalculate: () => void;
   connect: (config: BackendConfig) => Promise<void>;
@@ -54,6 +69,75 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * True when the model plainly implies the schedule has content — there are
+ * people, and something to place against their days. An empty
+ * `ScheduleResult` for such a model means "nothing has been calculated
+ * yet", never "the schedule is genuinely empty", so the `Schedule` tab must
+ * not be overwritten with it.
+ */
+function impliesSchedule(model: Model): boolean {
+  return (
+    model.people.length > 0 &&
+    (model.allocations.length > 0 || model.leave.length > 0 || model.overrides.length > 0)
+  );
+}
+
+/**
+ * The tabs a push must leave alone: every tab that failed to parse on the
+ * last read, plus `Schedule` when there is no computed result to write for
+ * a model that clearly has one. Both cloud writers clear a tab before
+ * writing it, so "write nothing there" is the only way to keep the user's
+ * data.
+ */
+function tabsToProtect(
+  model: Model,
+  entries: ScheduleResult['entries'],
+  unreadableTabs: readonly TabName[],
+): TabName[] {
+  const omitted = new Set<TabName>(unreadableTabs);
+  if (entries.length === 0 && impliesSchedule(model)) omitted.add('Schedule');
+  return [...omitted];
+}
+
+/** `scheduleAll`, but a model the scheduler rejects yields no result rather
+ * than an exception — the caller is restoring state, not asking a question,
+ * and `tabsToProtect` keeps an empty result from reaching the sheet. */
+function scheduleOrEmpty(model: Model): ScheduleResult {
+  try {
+    return scheduleAll(model, monthsOf(model));
+  } catch {
+    return EMPTY_RESULT;
+  }
+}
+
+function listTabs(tabs: readonly TabName[]): string {
+  if (tabs.length <= 1) return tabs.join('');
+  return `${tabs.slice(0, -1).join(', ')} and ${tabs[tabs.length - 1] ?? ''}`;
+}
+
+/**
+ * Names the constraint and the next action (DESIGN.md §4): which tab the
+ * app could not read, why, and what stops the data from being lost while
+ * the header stays broken.
+ */
+function dataNoticeFor(unreadableTabs: readonly TabName[], problemCount: number): string | null {
+  if (unreadableTabs.length > 0) {
+    const isPlural = unreadableTabs.length > 1;
+    const subject = `${listTabs(unreadableTabs)} ${isPlural ? 'tabs' : 'tab'}`;
+    const pronoun = isPlural ? 'them' : 'it';
+    return (
+      `The ${subject} could not be read: the header row does not match the columns the app expects. ` +
+      `Nothing from ${pronoun} was loaded, and the app will not write over ${pronoun}. ` +
+      `Restore the header row in your spreadsheet, then reload this page.`
+    );
+  }
+  if (problemCount > 0) {
+    return `Loaded with ${problemCount} problem(s) in the backend's data — see the console for detail.`;
+  }
+  return null;
+}
+
 export function useStore(): StoreApi {
   const initialCache = useRef(loadCache()).current;
 
@@ -65,6 +149,8 @@ export function useStore(): StoreApi {
   );
   const [status, setStatus] = useState<StoreStatus>('idle');
   const [notice, setNotice] = useState<string | null>(null);
+  const [dataNotice, setDataNotice] = useState<string | null>(null);
+  const [unreadableTabs, setUnreadableTabs] = useState<readonly TabName[]>([]);
 
   // Mirrors kept current every render so callbacks (debounced timers, async
   // continuations) that must not close over a stale value can read the
@@ -78,15 +164,21 @@ export function useStore(): StoreApi {
   configRef.current = config;
   const hashRef = useRef(lastCalculatedHash);
   hashRef.current = lastCalculatedHash;
+  const unreadableTabsRef = useRef(unreadableTabs);
+  unreadableTabsRef.current = unreadableTabs;
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const pushToAdapter = useCallback(
     async (pushModel: Model, entries: ScheduleResult['entries'], hash: string | null) => {
       setStatus('syncing');
+      const omitTabs = tabsToProtect(pushModel, entries, unreadableTabsRef.current);
       try {
         const adapter = getAdapter(configRef.current.backend);
-        await adapter.write(configRef.current, buildSheetPayload(pushModel, entries, hash ?? ''));
+        await adapter.write(
+          configRef.current,
+          buildSheetPayload(pushModel, entries, hash ?? '', omitTabs),
+        );
         setStatus('idle');
         setNotice(null);
       } catch (error) {
@@ -111,25 +203,36 @@ export function useStore(): StoreApi {
         const payload = await adapter.read(startingConfig);
         if (cancelled) return;
 
-        const { model: readModel, problems: modelProblems } = rowsToModel(payload);
-        const { entries, problems: scheduleProblems } = rowsToScheduleEntries(payload);
-        const { hash: metaHash } = rowsToMeta(payload);
+        const model_ = rowsToModel(payload);
+        const schedule_ = rowsToScheduleEntries(payload);
+        const meta_ = rowsToMeta(payload);
+        const readModel = model_.model;
+        const metaHash = meta_.hash;
+        const problems = [...model_.problems, ...schedule_.problems, ...meta_.problems];
+        const unreadable = [
+          ...model_.unreadableTabs,
+          ...schedule_.unreadableTabs,
+          ...meta_.unreadableTabs,
+        ];
 
         setModel(readModel);
-        setResult({ entries, residuals: [], violations: [] });
+        setResult({ entries: schedule_.entries, residuals: [], violations: [] });
         setLastCalculatedHash(metaHash);
-        saveCache(readModel, metaHash ?? hashModel(readModel), startingConfig);
+        setUnreadableTabs(unreadable);
+
+        // A read that lost data must not overwrite the copy that still has
+        // it. The cache is the only place a tab the backend could not be
+        // parsed out of might survive, so it wins over what just came back.
+        if (problems.length === 0 || loadCache() === null) {
+          saveCache(readModel, metaHash ?? hashModel(readModel), startingConfig);
+        }
         setStatus('idle');
 
-        const problemCount = modelProblems.length + scheduleProblems.length;
-        setNotice(
-          problemCount > 0
-            ? `Loaded with ${problemCount} problem(s) in the backend's data — see the console for detail.`
-            : null,
-        );
-        if (problemCount > 0) {
+        setNotice(null);
+        setDataNotice(dataNoticeFor(unreadable, problems.length));
+        if (problems.length > 0) {
           // eslint-disable-next-line no-console
-          console.warn('Problems loading from backend:', [...modelProblems, ...scheduleProblems]);
+          console.warn('Problems loading from backend:', problems);
         }
       } catch (error) {
         if (cancelled) return;
@@ -138,6 +241,10 @@ export function useStore(): StoreApi {
           setModel(cached.model);
           setLastCalculatedHash(cached.hash);
           setConfig(cached.config);
+          // Restoring the model without its schedule would leave `result`
+          // empty, and the next edit would push that emptiness over the
+          // Schedule tab. Recompute it from the very model being restored.
+          setResult(scheduleOrEmpty(cached.model));
           setNotice(
             `Could not reach the backend (${messageOf(error)}). Showing your last saved copy.`,
           );
@@ -225,9 +332,15 @@ export function useStore(): StoreApi {
       // clobbering unsaved local changes.
       const currentModel = modelRef.current;
       const hash = hashRef.current ?? hashModel(currentModel);
+      const entries = resultRef.current.entries;
       await adapter.write(
         newConfig,
-        buildSheetPayload(currentModel, resultRef.current.entries, hash),
+        buildSheetPayload(
+          currentModel,
+          entries,
+          hash,
+          tabsToProtect(currentModel, entries, unreadableTabsRef.current),
+        ),
       );
 
       setConfig(newConfig);
@@ -261,6 +374,8 @@ export function useStore(): StoreApi {
     isStale: hashModel(model) !== lastCalculatedHash,
     status,
     notice,
+    dataNotice,
+    unreadableTabs,
     update,
     recalculate,
     connect,

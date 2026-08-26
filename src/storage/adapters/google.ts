@@ -46,7 +46,18 @@ async function fetchOrExplain(input: string, init?: RequestInit): Promise<Respon
 }
 
 async function parseScriptResponse(response: Response): Promise<ScriptResponse> {
-  const body: unknown = await response.json();
+  // `response.json()` is as failure-prone as the fetch itself: a deployment
+  // whose access is not "Anyone" answers with Google's HTML sign-in page,
+  // and the raw `SyntaxError: Unexpected token '<'` that produces says
+  // nothing the user can act on. Name the actual cause instead.
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error(
+      'The Apps Script endpoint answered with a web page instead of data. That is what Google returns when the deployment\'s access is not set to "Anyone" — re-deploy it with "Who has access: Anyone".',
+    );
+  }
   if (!isScriptResponse(body)) {
     throw new Error('The Apps Script endpoint returned an unexpected response.');
   }
@@ -90,7 +101,10 @@ export const googleAdapter: StorageAdapter = {
     return body.payload ?? {};
   },
 
-  async write(config: BackendConfig, payload: SheetPayload): Promise<void> {
+  // A tab absent from `payload` is absent from the POST body, and Code.gs
+  // iterates the keys it is given — so an omitted tab is left untouched in
+  // the Sheet rather than cleared.
+  async write(config: BackendConfig, payload: Partial<SheetPayload>): Promise<void> {
     const response = await fetchOrExplain(config.location, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },

@@ -696,3 +696,41 @@ describe('serialize: buildSheetPayload', () => {
     expect(hash).toBe('abc123');
   });
 });
+
+describe('serialize: per-tab load health', () => {
+  it('names the tab whose header did not parse, not just the problem', () => {
+    const { model: parsed, problems, unreadableTabs } = rowsToModel({
+      People: [['id', 'name', 'Role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
+    });
+    expect(parsed.people).toEqual([]);
+    expect(problems).toHaveLength(1);
+    expect(unreadableTabs).toEqual(['People']);
+  });
+
+  it('reports no unreadable tab for a row-level problem — the tab itself parsed', () => {
+    const { problems, unreadableTabs } = rowsToModel({
+      People: [['id', 'name', 'role', 'managerId'], ['p1', 'Alex', 'BOSS', '']],
+    });
+    expect(problems).toHaveLength(1);
+    expect(unreadableTabs).toEqual([]);
+  });
+
+  it('names the Schedule and Meta tabs too', () => {
+    expect(rowsToScheduleEntries({ Schedule: [['nope']] }).unreadableTabs).toEqual(['Schedule']);
+    expect(rowsToMeta({ Meta: [['nope']] }).unreadableTabs).toEqual(['Meta']);
+  });
+});
+
+describe('serialize: buildSheetPayload omitTabs', () => {
+  it('leaves an omitted tab out of the payload entirely, rather than emptying it', () => {
+    const payload = buildSheetPayload(model, scheduleEntries, 'abc123', ['People', 'Schedule']);
+    expect('People' in payload).toBe(false);
+    expect('Schedule' in payload).toBe(false);
+    expect(payload.OTLs).toEqual(modelToRows(model).OTLs);
+    expect(payload.Meta).toEqual(metaToRows('abc123'));
+  });
+
+  it('is the full payload when nothing is omitted', () => {
+    expect(Object.keys(buildSheetPayload(model, scheduleEntries, 'abc123'))).toHaveLength(8);
+  });
+});

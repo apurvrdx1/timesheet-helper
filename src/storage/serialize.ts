@@ -114,6 +114,7 @@ function parseTab<T>(
   columns: readonly string[],
   parseRow: (row: string[], rowNum: number, problems: string[]) => T | undefined,
   problems: string[],
+  unreadableTabs: TabName[],
 ): T[] {
   const rows = payload[tab] ?? [];
   if (rows.length === 0) return [];
@@ -125,6 +126,11 @@ function parseTab<T>(
     problems.push(
       `${tab}: header row does not match expected columns [${columns.join(', ')}]; got [${header.join(', ')}]`,
     );
+    // The whole tab is dropped, not one row: whatever the sheet holds here
+    // could not be interpreted at all. Callers MUST treat such a tab as
+    // "contents unknown" and never write over it — see `buildSheetPayload`'s
+    // `omitTabs`.
+    unreadableTabs.push(tab);
     return [];
   }
 
@@ -532,10 +538,18 @@ export function scheduleEntriesToRows(entries: ScheduleEntry[]): string[][] {
  */
 export function rowsToScheduleEntries(
   payload: Partial<SheetPayload>,
-): { entries: ScheduleEntry[]; problems: string[] } {
+): { entries: ScheduleEntry[]; problems: string[]; unreadableTabs: TabName[] } {
   const problems: string[] = [];
-  const entries = parseTab(payload, 'Schedule', SCHEDULE_COLUMNS, rowToScheduleEntry, problems);
-  return { entries, problems };
+  const unreadableTabs: TabName[] = [];
+  const entries = parseTab(
+    payload,
+    'Schedule',
+    SCHEDULE_COLUMNS,
+    rowToScheduleEntry,
+    problems,
+    unreadableTabs,
+  );
+  return { entries, problems, unreadableTabs };
 }
 
 // ---------------------------------------------------------------------------
@@ -558,10 +572,11 @@ export function metaToRows(hash: string): string[][] {
  */
 export function rowsToMeta(
   payload: Partial<SheetPayload>,
-): { hash: string | null; problems: string[] } {
+): { hash: string | null; problems: string[]; unreadableTabs: TabName[] } {
   const problems: string[] = [];
+  const unreadableTabs: TabName[] = [];
   const rows = payload.Meta ?? [];
-  if (rows.length === 0) return { hash: null, problems };
+  if (rows.length === 0) return { hash: null, problems, unreadableTabs };
 
   const header = rows[0] ?? [];
   const headerMatches =
@@ -570,7 +585,7 @@ export function rowsToMeta(
     problems.push(
       `Meta: header row does not match expected columns [${META_COLUMNS.join(', ')}]; got [${header.join(', ')}]`,
     );
-    return { hash: null, problems };
+    return { hash: null, problems, unreadableTabs: ['Meta'] };
   }
 
   for (let i = 1; i < rows.length; i += 1) {
@@ -580,11 +595,11 @@ export function rowsToMeta(
       continue;
     }
     if (row[0] === MODEL_HASH_KEY) {
-      return { hash: row[1] ?? '', problems };
+      return { hash: row[1] ?? '', problems, unreadableTabs };
     }
   }
 
-  return { hash: null, problems };
+  return { hash: null, problems, unreadableTabs };
 }
 
 // ---------------------------------------------------------------------------
@@ -616,17 +631,21 @@ export function modelToRows(model: Model): SheetPayload {
  * string in `problems` and skipped, so one bad row never costs the rest of
  * the sheet. Missing tabs yield empty arrays.
  */
-export function rowsToModel(payload: Partial<SheetPayload>): { model: Model; problems: string[] } {
+export function rowsToModel(
+  payload: Partial<SheetPayload>,
+): { model: Model; problems: string[]; unreadableTabs: TabName[] } {
   const problems: string[] = [];
+  const unreadableTabs: TabName[] = [];
 
-  const otls = parseTab(payload, 'OTLs', OTL_COLUMNS, rowToOtl, problems);
-  const people = parseTab(payload, 'People', PEOPLE_COLUMNS, rowToPerson, problems);
+  const otls = parseTab(payload, 'OTLs', OTL_COLUMNS, rowToOtl, problems, unreadableTabs);
+  const people = parseTab(payload, 'People', PEOPLE_COLUMNS, rowToPerson, problems, unreadableTabs);
   const statHolidays = parseTab(
     payload,
     'StatHolidays',
     STAT_HOLIDAY_COLUMNS,
     rowToStatHoliday,
     problems,
+    unreadableTabs,
   );
   const allocations = parseTab(
     payload,
@@ -634,29 +653,51 @@ export function rowsToModel(payload: Partial<SheetPayload>): { model: Model; pro
     ALLOCATION_COLUMNS,
     rowToAllocation,
     problems,
+    unreadableTabs,
   );
-  const leave = parseTab(payload, 'Leave', LEAVE_COLUMNS, rowToLeave, problems);
-  const overrides = parseTab(payload, 'Overrides', OVERRIDE_COLUMNS, rowToOverride, problems);
+  const leave = parseTab(payload, 'Leave', LEAVE_COLUMNS, rowToLeave, problems, unreadableTabs);
+  const overrides = parseTab(
+    payload,
+    'Overrides',
+    OVERRIDE_COLUMNS,
+    rowToOverride,
+    problems,
+    unreadableTabs,
+  );
 
   return {
     model: { otls, people, statHolidays, allocations, leave, overrides },
     problems,
+    unreadableTabs,
   };
 }
 
 /**
- * Composes the full `SheetPayload` a write to a backend should send: the six
+ * Composes the `SheetPayload` a write to a backend should send: the six
  * model tabs plus the current `Schedule` (from the latest `scheduleAll`) and
  * `Meta` (the hash it was calculated against).
+ *
+ * `omitTabs` names tabs the caller must NOT overwrite — a tab whose header
+ * did not parse on the last read (`rowsToModel().unreadableTabs`), or one
+ * the caller has no trustworthy content for. An omitted key is absent from
+ * the returned payload, and every adapter leaves an absent tab exactly as
+ * it is. Preserving data the app cannot read is strictly better than
+ * replacing it with nothing.
  */
 export function buildSheetPayload(
   model: Model,
   entries: ScheduleEntry[],
   hash: string,
-): SheetPayload {
-  return {
+  omitTabs: readonly TabName[] = [],
+): Partial<SheetPayload> {
+  const full: SheetPayload = {
     ...modelToRows(model),
     Schedule: scheduleEntriesToRows(entries),
     Meta: metaToRows(hash),
   };
+  if (omitTabs.length === 0) return full;
+
+  const omitted = new Set<TabName>(omitTabs);
+  const kept = (Object.keys(full) as TabName[]).filter((tab) => !omitted.has(tab));
+  return Object.fromEntries(kept.map((tab) => [tab, full[tab]])) as Partial<SheetPayload>;
 }
