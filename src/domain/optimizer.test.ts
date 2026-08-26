@@ -305,10 +305,66 @@ describe('scheduleWeek', () => {
 
       const tue = out.entries.filter((e) => e.date === '2026-09-08');
       const pinned = tue.find((e) => e.otlProjectCode === 'P-1001');
-      // 2 + 2 override blocks merged with the calculated fill for that day...
-      expect(pinned?.blocks).toBe(15);
+      // The two overrides on the same cell still merge into a single row —
+      // which is what this test is for. They merge to 2 + 2 blocks and stop
+      // there: spec 3.8 makes a pinned cell an input, so phase 3 no longer
+      // pours its demand for the same code onto it. (This assertion used to
+      // read 15, encoding the merge-with-CALC behaviour that was the S1 bug:
+      // a user who pinned 2h got 7.5h back.)
+      expect(pinned?.blocks).toBe(4);
+      expect(pinned?.overrideBlocks).toBe(4);
       // ...and the merged cell still reads as user-set, because the UI locks on it.
       expect(pinned?.source).toBe('OVERRIDE');
+      // The day is still rebalanced to a full 7.5h around the pin.
+      expect(totalFor(out, '2026-09-08')).toBe(15);
+    });
+
+    it('treats a pinned cell as fixed and rebalances the day around it (S1)', () => {
+      // The user pins Tuesday/P-1001 to 2h. Demand for the very same code is
+      // effectively unlimited. Before the fix the optimizer piled the rest of
+      // Tuesday onto that cell and handed back 7.5h — the cell was not fixed
+      // at all. The 2h must survive, and the other 5.5h must go elsewhere.
+      const out = scheduleWeek(input({
+        overrides: [{
+          personId: 'p1', date: '2026-09-08', otlProjectCode: 'P-1001', hours: 2,
+        }],
+        demand: [{ otlProjectCode: 'P-1001', month: '2026-09', blocks: 999 }],
+      }));
+      const tue = out.entries.filter((e) => e.date === '2026-09-08');
+      expect(tue.find((e) => e.otlProjectCode === 'P-1001'))
+        .toMatchObject({ blocks: 4, overrideBlocks: 4, source: 'OVERRIDE' });
+      expect(totalFor(out, '2026-09-08')).toBe(15);
+      // Every other day is free to take the same code at full tilt.
+      expect(blocksOn(out, 'P-1001')).toBeGreaterThan(4);
+    });
+
+    it('lets a second code absorb the day a pin left half empty (S1)', () => {
+      const out = scheduleWeek(input({
+        overrides: [{
+          personId: 'p1', date: '2026-09-08', otlProjectCode: 'P-1001', hours: 2,
+        }],
+        demand: [
+          { otlProjectCode: 'P-1001', month: '2026-09', blocks: 30 },
+          { otlProjectCode: 'P-1002', month: '2026-09', blocks: 30 },
+        ],
+      }));
+      const tue = out.entries.filter((e) => e.date === '2026-09-08');
+      expect(tue.find((e) => e.otlProjectCode === 'P-1001')?.blocks).toBe(4);
+      // P-1002 is not pinned on Tuesday, so it may take the rest of the day.
+      expect(tue.find((e) => e.otlProjectCode === 'P-1002')?.blocks).toBeGreaterThan(0);
+      expect(totalFor(out, '2026-09-08')).toBe(15);
+    });
+
+    it('still tops up a pinned DEFAULT OPEX cell, because the day has nowhere else to go', () => {
+      // The one sanctioned corner. Phase 4 must reach 7.5h, and the default
+      // OPEX code is the only code it may use, so the cell grows past the pin.
+      // overrideBlocks still reports exactly what the user typed.
+      const out = scheduleWeek(input({
+        overrides: [{ personId: 'p1', date: '2026-09-08', otlProjectCode: OPEX, hours: 2 }],
+      }));
+      const cell = out.entries.find(
+        (e) => e.date === '2026-09-08' && e.otlProjectCode === OPEX);
+      expect(cell).toMatchObject({ blocks: 15, overrideBlocks: 4, source: 'OVERRIDE' });
       expect(totalFor(out, '2026-09-08')).toBe(15);
     });
 

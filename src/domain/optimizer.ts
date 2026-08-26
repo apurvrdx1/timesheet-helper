@@ -164,6 +164,13 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
 
   // 3. Fill CAPEX up to the room the floor leaves, minus every override block
   //    already booked somewhere other than the default OPEX code.
+  //
+  //    Spec 3.8: "An overridden cell is fixed. Recalculation treats it as an
+  //    input and rebalances the rest of that day around it." A pinned cell is
+  //    therefore skipped outright here — piling more of the same code onto it
+  //    would silently grow the number the user chose. The day's remaining
+  //    capacity goes to other codes, and to the default OPEX code in phase 4,
+  //    which is what rebalancing around the pin means.
   let capexBudget = Math.max(0, capacity - floor - overriddenCapex - overriddenOther);
 
   for (const item of demand) {
@@ -173,6 +180,7 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
     for (const date of dates) {
       if (want <= 0) break;
       if (monthOf(date) !== item.month) continue;   // a day only spends its own month
+      if (overriddenCells.has(`${date}|${item.otlProjectCode}`)) continue;
       const left = dayRemaining.get(date) ?? 0;
       if (left <= 0) continue;
 
@@ -187,7 +195,12 @@ export function scheduleWeek(input: WeekInput): WeekOutput {
     }
   }
 
-  // 4. Everything still open becomes default OPEX.
+  // 4. Everything still open becomes default OPEX. This is the one place a
+  //    pinned cell may still grow: if the user pinned the default OPEX code
+  //    itself, the day has nowhere else to go and would otherwise fall short
+  //    of 7.5h. The cell keeps its OVERRIDE source and its overrideBlocks
+  //    still reports only what the user actually typed, so the exact pinned
+  //    value survives even where the total does not.
   for (const date of dates) {
     const left = dayRemaining.get(date) ?? 0;
     if (left > 0) {
