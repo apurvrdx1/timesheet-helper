@@ -81,8 +81,40 @@ const NETWORK_FAILURE_RE = /network_error|failed to fetch|networkerror|no_networ
 
 let cachedClientPromise: { key: string; promise: Promise<IPublicClientApplication> } | undefined;
 
+/**
+ * The authority segment to use, with an empty string treated exactly like an
+ * absent one.
+ *
+ * The connection form's own help text says "Leave blank to use common", and a
+ * text input that has been focused and cleared reports `''`, not `undefined`.
+ * `??` does not catch `''`, so a user who followed the help text got
+ * `https://login.microsoftonline.com/` — an authority MSAL rejects — and a
+ * generic sign-in failure, with the bad value persisted across reloads.
+ */
+function authorityOf(config: BackendConfig): string {
+  return config.authority?.trim() || DEFAULT_AUTHORITY;
+}
+
 function authorityUrl(authority: string): string {
   return `https://login.microsoftonline.com/${authority}`;
+}
+
+/**
+ * The forms Entra accepts as the authority path segment: the three
+ * well-known audiences, a tenant GUID, or a verified domain. Anything else
+ * (a full URL pasted in, a stray slash, a space) produces an authority MSAL
+ * cannot use, and failing here names the field instead of surfacing a
+ * generic "sign-in failed" after a popup round trip.
+ */
+const WELL_KNOWN_AUTHORITIES: readonly string[] = ['common', 'consumers', 'organizations'];
+const TENANT_DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+
+function isUsableAuthority(authority: string): boolean {
+  return (
+    WELL_KNOWN_AUTHORITIES.includes(authority) ||
+    GUID_RE.test(authority) ||
+    TENANT_DOMAIN_RE.test(authority)
+  );
 }
 
 async function createClient(clientId: string, authority: string): Promise<IPublicClientApplication> {
@@ -164,8 +196,7 @@ async function explainSignInFailure(error: unknown): Promise<Error> {
 
 async function acquireToken(config: BackendConfig): Promise<string> {
   const clientId = config.clientId ?? '';
-  const authority = config.authority ?? DEFAULT_AUTHORITY;
-  const app = await getClient(clientId, authority);
+  const app = await getClient(clientId, authorityOf(config));
   await app.initialize();
 
   const account = app.getActiveAccount() ?? app.getAllAccounts()[0];
@@ -218,6 +249,13 @@ export const microsoftAdapter: StorageAdapter = {
     }
     if (!config.location) {
       problems.push('Enter the sharing link to the workbook.');
+    }
+    const authority = config.authority?.trim() ?? '';
+    if (authority !== '' && !isUsableAuthority(authority)) {
+      problems.push(
+        'The authority must be common, consumers, organizations, a tenant ID, or a tenant ' +
+        'domain — leave it blank to use common.',
+      );
     }
     return problems;
   },

@@ -137,6 +137,55 @@ describe('microsoftAdapter.validate', () => {
     const problems = microsoftAdapter.validate({ ...config, secret: undefined });
     expect(problems.join(' ')).not.toMatch(/secret/i);
   });
+
+  // N4: the field's own help text says "Leave blank to use common", and a
+  // text input that has been focused and cleared reports '' — never
+  // undefined. Blank must be as valid as absent.
+  it('accepts a blank authority, exactly as the field\u2019s help text promises', () => {
+    expect(microsoftAdapter.validate({ ...config, authority: '' })).toEqual([]);
+    expect(microsoftAdapter.validate({ ...config, authority: '   ' })).toEqual([]);
+  });
+
+  it('accepts a tenant GUID and a tenant domain', () => {
+    expect(microsoftAdapter.validate({ ...config, authority: '99999999-8888-7777-6666-555555555555' })).toEqual([]);
+    expect(microsoftAdapter.validate({ ...config, authority: 'contoso.onmicrosoft.com' })).toEqual([]);
+  });
+
+  it('rejects an authority that could never produce a usable MSAL url', () => {
+    expect(microsoftAdapter.validate({ ...config, authority: 'https://login.microsoftonline.com/common' }))
+      .toHaveLength(1);
+    expect(microsoftAdapter.validate({ ...config, authority: 'my tenant' })).toHaveLength(1);
+    expect(microsoftAdapter.validate({ ...config, authority: 'common/oauth2' })).toHaveLength(1);
+  });
+});
+
+describe('microsoftAdapter: a blank authority means common, not an empty path', () => {
+  it('builds the common authority url when the authority is an empty string', async () => {
+    mockMethods.loginPopup.mockResolvedValue({ accessToken: 'popup-tok', account });
+
+    await microsoftAdapter.connect({ ...config, authority: '' });
+
+    const built = pcaConstructions[0] as { auth: { authority: string } } | undefined;
+    expect(built?.auth.authority).toBe('https://login.microsoftonline.com/common');
+  });
+
+  it('builds the common authority url when the authority is whitespace', async () => {
+    mockMethods.loginPopup.mockResolvedValue({ accessToken: 'popup-tok', account });
+
+    await microsoftAdapter.connect({ ...config, authority: '  ' });
+
+    const built = pcaConstructions[0] as { auth: { authority: string } } | undefined;
+    expect(built?.auth.authority).toBe('https://login.microsoftonline.com/common');
+  });
+
+  it('still honours a real authority', async () => {
+    mockMethods.loginPopup.mockResolvedValue({ accessToken: 'popup-tok', account });
+
+    await microsoftAdapter.connect({ ...config, authority: 'organizations' });
+
+    const built = pcaConstructions[0] as { auth: { authority: string } } | undefined;
+    expect(built?.auth.authority).toBe('https://login.microsoftonline.com/organizations');
+  });
 });
 
 describe('microsoftAdapter.connect', () => {
