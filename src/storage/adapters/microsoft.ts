@@ -14,13 +14,16 @@
  * - `disconnect()` is real: `logoutPopup` plus clearing the cached workbook
  *   id, since a new sign-in may point at a different account/workbook.
  * - `validate()` never asks for a shared secret — there isn't one.
+ *
+ * MSAL (~900 KB) is loaded with a dynamic `import()`, not a static one, so
+ * it lands in its own chunk instead of the main bundle. Most visitors to
+ * this single-user GitHub Pages site use the Google or local-only backend
+ * and never need it; only `connect()`/`read()`/`write()`/`disconnect()` on
+ * this adapter trigger the fetch, and only the first call pays for it —
+ * the resolved module and the client built from it are cached in module
+ * scope (see `cachedClient` below).
  */
-import {
-  PublicClientApplication,
-  InteractionRequiredAuthError,
-  type Configuration,
-  type IPublicClientApplication,
-} from '@azure/msal-browser';
+import type { Configuration, IPublicClientApplication } from '@azure/msal-browser';
 import type { BackendConfig, StorageAdapter } from '../adapter';
 import type { SheetPayload, TabName } from '../serialize';
 import { resolveWorkbookId, readWorksheet, writeWorksheet } from './graph';
@@ -59,11 +62,15 @@ function authorityUrl(authority: string): string {
   return `https://login.microsoftonline.com/${authority}`;
 }
 
-function getClient(clientId: string, authority: string): IPublicClientApplication {
+async function getClient(clientId: string, authority: string): Promise<IPublicClientApplication> {
   const key = `${clientId}::${authority}`;
   if (cachedClient !== undefined && cachedClient.key === key) {
     return cachedClient.app;
   }
+  // Dynamic, not static: keeps MSAL out of the main bundle for the visitors
+  // who never touch this backend. Once loaded, the browser's module cache
+  // makes a repeat `import()` of the same specifier resolve instantly.
+  const { PublicClientApplication } = await import('@azure/msal-browser');
   const msalConfig: Configuration = {
     auth: {
       clientId,
@@ -82,14 +89,18 @@ function getClient(clientId: string, authority: string): IPublicClientApplicatio
   return app;
 }
 
-function isConsentFailure(error: unknown): boolean {
+async function isConsentFailure(error: unknown): Promise<boolean> {
+  // Also dynamic, for the same reason as getClient — but by the time this
+  // runs, loginPopup has already failed, so `@azure/msal-browser` is
+  // already loaded and this import resolves from the module cache.
+  const { InteractionRequiredAuthError } = await import('@azure/msal-browser');
   if (error instanceof InteractionRequiredAuthError) return true;
   const message = error instanceof Error ? error.message : String(error);
   return CONSENT_ERROR_RE.test(message);
 }
 
-function explainSignInFailure(error: unknown): Error {
-  if (isConsentFailure(error)) {
+async function explainSignInFailure(error: unknown): Promise<Error> {
+  if (await isConsentFailure(error)) {
     return new Error(CONSENT_FAILURE_MESSAGE);
   }
   const message = error instanceof Error ? error.message : String(error);
@@ -99,7 +110,7 @@ function explainSignInFailure(error: unknown): Error {
 async function acquireToken(config: BackendConfig): Promise<string> {
   const clientId = config.clientId ?? '';
   const authority = config.authority ?? DEFAULT_AUTHORITY;
-  const app = getClient(clientId, authority);
+  const app = await getClient(clientId, authority);
   await app.initialize();
 
   const account = app.getActiveAccount() ?? app.getAllAccounts()[0];
@@ -118,7 +129,7 @@ async function acquireToken(config: BackendConfig): Promise<string> {
     app.setActiveAccount(result.account);
     return result.accessToken;
   } catch (error) {
-    throw explainSignInFailure(error);
+    throw await explainSignInFailure(error);
   }
 }
 
