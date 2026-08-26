@@ -16,7 +16,10 @@ export function keyOf(month: IsoMonth, otl: OtlCode): string {
  * The exact inverse of `keyOf`, kept beside it so encoder and decoder cannot
  * drift. Parses on the first delimiter only: OTL codes are free text and may
  * themselves contain '|'. The month is always fixed-width 'YYYY-MM'.
- * Returns null for anything `keyOf` could not have produced.
+ *
+ * Returns null only when the string carries no '|' at all, which is the one
+ * shape `keyOf` can never produce. It does not otherwise validate: a key whose
+ * prefix is not a well-formed 'YYYY-MM' is still split and returned.
  */
 export function parseKey(key: string): { month: IsoMonth; otlProjectCode: OtlCode } | null {
   const sep = key.indexOf('|');
