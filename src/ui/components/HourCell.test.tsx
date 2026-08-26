@@ -85,4 +85,29 @@ describe('HourCell', () => {
     expect(screen.getByLabelText('Manually set — recalculation will preserve this')).toBeInTheDocument();
   });
 
+  // N8: the visible span carries the TOTAL and is aria-hidden; the input's
+  // accessible value is the PIN. Where the two differ, a screen-reader user
+  // heard "2.0" for a cell a sighted user reads as "7.5", with nothing in
+  // the announcement to reconcile them.
+  it('names both the pin and the cell total on the field itself when they differ', () => {
+    render(<HourCell {...base} hours={7.5} source="OVERRIDE" overrideHours={2} />);
+
+    const field = screen.getByRole('spinbutton');
+    expect(field).toHaveAccessibleName(/2\.0h you set/i);
+    expect(field).toHaveAccessibleName(/totals 7\.5h/i);
+    // The cell it belongs to is still identified.
+    expect(field).toHaveAccessibleName(/P-1001 hours for p1, 2026-09-07/);
+  });
+
+  it('leaves the field name plain when the pin is the whole cell', () => {
+    render(<HourCell {...base} hours={4} source="OVERRIDE" overrideHours={4} />);
+    expect(screen.getByRole('spinbutton'))
+      .toHaveAccessibleName('P-1001 hours for p1, 2026-09-07');
+  });
+
+  it('leaves the field name plain on a calculated cell', () => {
+    render(<HourCell {...base} />);
+    expect(screen.getByRole('spinbutton'))
+      .toHaveAccessibleName('P-1001 hours for p1, 2026-09-07');
+  });
 });

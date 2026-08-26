@@ -85,6 +85,31 @@ function lockTooltipFor(pinned: number, total: number): string {
          `The optimizer added ${(total - pinned).toFixed(1)}h to fill the day.`;
 }
 
+/**
+ * The field's accessible name.
+ *
+ * The visible span carries the cell's TOTAL and is `aria-hidden`, while the
+ * input's accessible value is the PIN — the part the user actually typed.
+ * They differ in exactly one place: a pin on the default OPEX code that
+ * phase 4 of the optimizer topped up to fill the day. A screen-reader user
+ * would then hear "2.0" for a cell a sighted user reads as "7.5", with
+ * nothing in the announcement to reconcile the two.
+ *
+ * So when the two figures differ, the name says both and which is which.
+ * When they agree there is nothing to reconcile and the plain name stands.
+ */
+function fieldLabelFor(
+  otlProjectCode: OtlCode,
+  personId: PersonId,
+  date: IsoDate,
+  pinned: number,
+  total: number,
+): string {
+  const base = `${otlProjectCode} hours for ${personId}, ${date}`;
+  if (pinned >= total) return base;
+  return `${base}: editing the ${pinned.toFixed(1)}h you set; this cell totals ${total.toFixed(1)}h`;
+}
+
 /** No "lock" name exists in the Astryx icon registry (DESIGN.md §3 asks for
  * one); `Icon` accepts a custom SVG component in place of a registry name,
  * so a minimal padlock glyph is supplied directly rather than repurposing an
@@ -159,7 +184,7 @@ export function HourCell({
     onRevert();
   };
 
-  const label = `${otlProjectCode} hours for ${personId}, ${date}`;
+  const label = fieldLabelFor(otlProjectCode, personId, date, editedHours, hours);
   const lockTooltip = lockTooltipFor(editedHours, hours);
 
   return (
