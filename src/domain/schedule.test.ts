@@ -275,6 +275,80 @@ describe('scheduleAll', () => {
     expect(dropped.every((v) => v.scope === '2026-09')).toBe(true);
   });
 
+  it('carries a sub-half-hour allocation remainder forward instead of dropping it (bug A)', () => {
+    // 1.3h is not a multiple of 0.5: it floors to 1.0h (2 blocks) with a
+    // 0.3h remainder that cannot be represented as a block at all. The
+    // remainder must still show up somewhere, or it has silently vanished.
+    const r = scheduleAll(model({
+      allocations: [
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 1.3 },
+      ],
+    }), ['2026-09']);
+
+    const dropped = r.violations.filter((v) => v.kind === 'ALLOCATION_RESIDUAL_DROPPED');
+    expect(dropped).toHaveLength(1);
+
+    const remainder = r.residuals.filter((x) => x.reason === 'SUB_BLOCK_REMAINDER');
+    expect(remainder).toHaveLength(1);
+    expect(remainder[0]?.personId).toBe('p1');
+    expect(remainder[0]?.otlProjectCode).toBe('P-1001');
+    expect(remainder[0]?.month).toBe('2026-09');
+    // Blocks is always a whole half-hour count; a sub-block remainder is by
+    // definition less than one, so it can never be represented there.
+    expect(remainder[0]?.blocks).toBe(0);
+    expect(remainder[0]?.subBlockHours).toBeCloseTo(0.3, 10);
+
+    // Nothing vanished: 1.0h placed + 0.3h carried as a residual = 1.3h.
+    expect(hoursOn(r, 'p1', 'P-1001')).toBe(1);
+  });
+
+  it('does not let an allocation naming an unknown person reach nobody (bug B)', () => {
+    const r = scheduleAll(model({
+      allocations: [
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'ghost', hours: 20 },
+      ],
+    }), ['2026-09']);
+
+    const unknown = r.violations.filter((v) => v.kind === 'ALLOCATION_UNKNOWN_PERSON');
+    expect(unknown).toHaveLength(1);
+    expect(unknown[0]?.personId).toBe('ghost');
+    expect(unknown[0]?.message).toContain('ghost');
+
+    // Nobody named 'ghost' exists, so nobody is ever scheduled for them —
+    // but the 40 blocks (20h) must still reach the manager or a residual,
+    // never nowhere.
+    expect(r.entries.some((e) => e.personId === 'ghost')).toBe(false);
+    const placedForOtl = r.entries
+      .filter((e) => e.otlProjectCode === 'P-1001')
+      .reduce((s, e) => s + e.blocks, 0);
+    const residualForOtl = r.residuals
+      .filter((x) => x.otlProjectCode === 'P-1001')
+      .reduce((s, x) => s + x.blocks, 0);
+    expect(placedForOtl + residualForOtl).toBe(40);
+  });
+
+  it('does not double-count an unknown-person row against a real monthly total (bug B)', () => {
+    // The 20h named to 'ghost' is carved out of the 100h monthly total, not
+    // additional to it. If the fix both grew the unassigned gap AND kept
+    // adding the orphaned amount on top, this would over-count by 40 blocks.
+    const r = scheduleAll(model({
+      allocations: [
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: null, hours: 100 },
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 10 },
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'ghost', hours: 20 },
+      ],
+    }), ['2026-09']);
+
+    expect(hoursOn(r, 'p1', 'P-1001')).toBe(10);
+    const placedForOtl = r.entries
+      .filter((e) => e.otlProjectCode === 'P-1001')
+      .reduce((s, e) => s + e.blocks, 0);
+    const residualForOtl = r.residuals
+      .filter((x) => x.otlProjectCode === 'P-1001')
+      .reduce((s, x) => s + x.blocks, 0);
+    expect(placedForOtl + residualForOtl).toBe(200); // 100h total, no more, no less
+  });
+
   it('returns violations in a stable total order', () => {
     const m = model({
       people: [

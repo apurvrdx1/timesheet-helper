@@ -90,7 +90,10 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
 
   // Allocation rows are inputs at a system boundary. A value that is not a
   // multiple of 0.5 cannot be represented as blocks, and truncating it in
-  // silence is the same defect class already fixed for overrides.
+  // silence is the same defect class already fixed for overrides. The
+  // Violation flags that the input was off the half-hour grid; the Residual
+  // is where the leftover fraction actually goes — flagging alone does not
+  // carry it forward, and the two serve different purposes for the UI.
   for (const a of model.allocations) {
     const { blocks, residualHours } = hoursToBlocks(a.hours);
     if (residualHours <= 0) continue;
@@ -99,8 +102,18 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
     violations.push({
       personId: a.personId, scope: a.month, kind: 'ALLOCATION_RESIDUAL_DROPPED',
       message: `The ${a.hours}h ${which} on ${a.otlProjectCode} in ${a.month} ` +
-               `booked ${blocksToHours(blocks)}h; ${residualHours}h does not ` +
-               `fit a half-hour block and was dropped.`,
+               `does not fit a half-hour block: ${blocksToHours(blocks)}h was ` +
+               `booked and ${residualHours}h is carried forward as a residual.`,
+    });
+    // The fraction is smaller than the scheduling grain itself, so it can
+    // never become a block — not placed, not carried as blocks. `blocks`
+    // stays 0 by construction; `subBlockHours` is the only honest place to
+    // put it. Nothing here disturbs the block-denominated conservation
+    // ledger in invariants.ts, since `available` there was already
+    // floor-based and never counted this fraction to begin with.
+    residuals.push({
+      personId: a.personId, otlProjectCode: a.otlProjectCode, month: a.month,
+      blocks: 0, reason: 'SUB_BLOCK_REMAINDER', subBlockHours: residualHours,
     });
   }
 
@@ -142,17 +155,44 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
   }
 
   // 2. Unassigned budget: an OTL's monthly total minus what was handed out.
+  //
+  // An allocation row can name a personId that is not in model.people — a
+  // deleted report, a typo, a hand-edited sheet. `assignmentBlocks` only ever
+  // matches a row against a real person's id, so such a row is never claimed
+  // by anyone's schedule. Counting it in `handedOutLegit` (the portion that
+  // actually reaches a person) would make it disappear: it would shrink the
+  // computed gap without any person ever being scheduled for it. It still
+  // counts in `handedOutAll`, exactly as invariants.ts's own independent
+  // `available` calculation does, so `available` here and there stay in
+  // lockstep and the gap this block computes is `available - handedOutLegit`
+  // — never smaller than what invariants.ts expects to see accounted for.
+  const personIds = new Set(model.people.map((p) => p.id));
   const totals = new Map<string, Blocks>();
-  const handedOut = new Map<string, Blocks>();
+  const handedOutAll = new Map<string, Blocks>();
+  const handedOutLegit = new Map<string, Blocks>();
   for (const a of model.allocations) {
     const key = keyOf(a.month, a.otlProjectCode);
     const blocks = hoursToBlocks(a.hours).blocks;
-    if (a.personId === null) totals.set(key, (totals.get(key) ?? 0) + blocks);
-    else handedOut.set(key, (handedOut.get(key) ?? 0) + blocks);
+    if (a.personId === null) {
+      totals.set(key, (totals.get(key) ?? 0) + blocks);
+      continue;
+    }
+    handedOutAll.set(key, (handedOutAll.get(key) ?? 0) + blocks);
+    if (personIds.has(a.personId)) {
+      handedOutLegit.set(key, (handedOutLegit.get(key) ?? 0) + blocks);
+    } else {
+      violations.push({
+        personId: a.personId, scope: a.month, kind: 'ALLOCATION_UNKNOWN_PERSON',
+        message: `The allocation for ${a.personId} on ${a.otlProjectCode} in ` +
+                 `${a.month} names a person who is not in the people list; ` +
+                 `treated as unassigned budget rather than reaching nobody.`,
+      });
+    }
   }
   const unassigned = new Map<string, Blocks>();
-  for (const [key, total] of totals) {
-    const gap = total - (handedOut.get(key) ?? 0);
+  for (const key of new Set([...totals.keys(), ...handedOutAll.keys()])) {
+    const available = Math.max(totals.get(key) ?? 0, handedOutAll.get(key) ?? 0);
+    const gap = available - (handedOutLegit.get(key) ?? 0);
     if (gap > 0) unassigned.set(key, gap);
   }
 
@@ -198,8 +238,15 @@ export function scheduleAll(model: Model, months: IsoMonth[]): ScheduleResult {
     cmp(a.personId, b.personId) ||
     cmp(a.date, b.date) ||
     cmp(a.otlProjectCode, b.otlProjectCode));
+  // personId and reason are needed as tiebreakers now that a single
+  // (month, otlProjectCode) key can carry more than one residual — e.g. an
+  // allocation's SUB_BLOCK_REMAINDER alongside an UNASSIGNED/UNABSORBED
+  // carry-forward for the same key.
   residuals.sort((a, b) =>
-    cmp(a.month, b.month) || cmp(a.otlProjectCode, b.otlProjectCode));
+    cmp(a.month, b.month) ||
+    cmp(a.otlProjectCode, b.otlProjectCode) ||
+    cmp(a.personId ?? '', b.personId ?? '') ||
+    cmp(a.reason, b.reason));
   // Violations are output too, and output has to be deterministic. Message is
   // the last tiebreaker, so the order only ever ties for identical rows.
   violations.sort((a, b) =>

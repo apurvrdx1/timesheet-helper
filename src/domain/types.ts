@@ -13,7 +13,7 @@ export type OtlCategory = 'CAPEX' | 'OPEX' | 'LEAVE';
 export type LeaveSubtype = 'VACATION' | 'STAT' | 'PERSONAL' | 'SICK';
 export type Role = 'MANAGER' | 'REPORT';
 export type EntrySource = 'CALC' | 'OVERRIDE' | 'LEAVE';
-export type ResidualReason = 'UNABSORBED' | 'UNASSIGNED';
+export type ResidualReason = 'UNABSORBED' | 'UNASSIGNED' | 'SUB_BLOCK_REMAINDER';
 
 export interface Otl {
   projectCode: OtlCode;
@@ -86,6 +86,16 @@ export interface Residual {
   month: IsoMonth;
   blocks: Blocks;
   reason: ResidualReason;
+  /**
+   * Present only when `reason` is 'SUB_BLOCK_REMAINDER': the fractional hours
+   * (always strictly less than `HOURS_PER_BLOCK`) that could not be placed,
+   * carried, or represented as blocks at all — the input simply was not on
+   * the half-hour grid. `blocks` is 0 for these residuals by construction:
+   * `Blocks` is always a whole half-hour count, so a sub-block remainder has
+   * no honest value there. Absent (not merely 0) for every other reason,
+   * whose residuals are genuinely block-denominated.
+   */
+  subBlockHours?: number;
 }
 
 export interface Violation {
@@ -101,8 +111,15 @@ export interface Violation {
     | 'OVERRIDE_ON_LEAVE_DAY'
     /** An override's hours did not divide into whole half-hour blocks. */
     | 'OVERRIDE_RESIDUAL_DROPPED'
-    /** An allocation row's hours did not divide into whole half-hour blocks. */
+    /**
+     * An allocation row's hours did not divide into whole half-hour blocks.
+     * The whole-block portion is still booked and the remainder is carried
+     * forward as a `Residual` with reason 'SUB_BLOCK_REMAINDER' — this
+     * violation flags the malformed input, it does not mean the hours vanished.
+     */
     | 'ALLOCATION_RESIDUAL_DROPPED'
+    /** An allocation row names a personId absent from `model.people`. */
+    | 'ALLOCATION_UNKNOWN_PERSON'
     /** The model has more than one MANAGER; only the first is a cascade target. */
     | 'MULTIPLE_MANAGERS'
     /** Placed + carried does not reconcile against the budget for a key. */
