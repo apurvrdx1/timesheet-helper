@@ -134,6 +134,96 @@ describe('WeeksPage', () => {
 
 });
 
+/**
+ * Override survival is the spec's headline promise: a hand-set hour must
+ * write with the right {personId, date, otlProjectCode, hours} key, an edit
+ * to an already-overridden cell must replace that entry rather than
+ * duplicate it, a revert must remove exactly one cell's override, and
+ * clearing a week must never reach into an adjacent week's overrides (that
+ * would be silent data loss). These drive WeeksPage's onOverride/onRevert/
+ * onClearOverrides wiring — upsertOverride, removeOverride, and
+ * clearOverridesForWeek — through the real WeekTable/HourCell UI rather
+ * than calling the (unexported) helpers directly.
+ */
+describe('WeeksPage — override lifecycle', () => {
+  it('writes a new override keyed to the exact cell that was edited', async () => {
+    const update = vi.fn<(next: Model) => void>();
+    render(<WeeksPage model={model} month="2026-09" update={update} onMonthChange={vi.fn()} />);
+    await userEvent.click(screen.getByText(/7 – 11 Sep 2026/));
+
+    const cell = screen.getByRole('spinbutton', { name: /OPEX-ADMIN hours for mgr, 2026-09-07/i });
+    await userEvent.clear(cell);
+    await userEvent.type(cell, '4{Enter}');
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0]?.[0]?.overrides).toEqual([
+      { personId: 'mgr', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 4 },
+    ]);
+  });
+
+  it('replaces an existing override for the same cell instead of duplicating it', async () => {
+    const withOverride: Model = { ...model, overrides: [
+      { personId: 'mgr', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 2 },
+    ] };
+    const update = vi.fn<(next: Model) => void>();
+    render(<WeeksPage model={withOverride} month="2026-09" update={update} onMonthChange={vi.fn()} />);
+    await userEvent.click(screen.getByText(/7 – 11 Sep 2026/));
+
+    const cell = screen.getByRole('spinbutton', { name: /OPEX-ADMIN hours for mgr, 2026-09-07/i });
+    expect(cell).toHaveValue('2.0');
+    await userEvent.clear(cell);
+    await userEvent.type(cell, '5{Enter}');
+
+    expect(update).toHaveBeenCalledTimes(1);
+    // Exactly one entry for this key, holding the new hours — not two.
+    expect(update.mock.calls[0]?.[0]?.overrides).toEqual([
+      { personId: 'mgr', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 5 },
+    ]);
+  });
+
+  it('reverts a single cell, leaving another override untouched', async () => {
+    const twoOverrides: Model = { ...model, overrides: [
+      { personId: 'mgr', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 2 },
+      { personId: 'p1', date: '2026-09-08', otlProjectCode: 'OPEX-ADMIN', hours: 3 },
+    ] };
+    const update = vi.fn<(next: Model) => void>();
+    render(<WeeksPage model={twoOverrides} month="2026-09" update={update} onMonthChange={vi.fn()} />);
+    await userEvent.click(screen.getByText(/7 – 11 Sep 2026/));
+
+    // Only the manager's cell is overridden in the Manager table, so the
+    // revert control is unambiguous once scoped to that table.
+    const managerTable = screen.getByRole('table', { name: /manager/i });
+    await userEvent.click(within(managerTable).getByRole('button', { name: /revert to calculated value/i }));
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0]?.[0]?.overrides).toEqual([
+      { personId: 'p1', date: '2026-09-08', otlProjectCode: 'OPEX-ADMIN', hours: 3 },
+    ]);
+  });
+
+  it('clears only the overrides in the week being cleared, not an adjacent week', async () => {
+    const twoWeeks: Model = { ...model, overrides: [
+      { personId: 'mgr', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 2 },
+      { personId: 'mgr', date: '2026-09-14', otlProjectCode: 'OPEX-ADMIN', hours: 3 },
+    ] };
+    const update = vi.fn<(next: Model) => void>();
+    render(<WeeksPage model={twoWeeks} month="2026-09" update={update} onMonthChange={vi.fn()} />);
+    await userEvent.click(screen.getByText(/7 – 11 Sep 2026/));
+
+    await userEvent.click(
+      screen.getByRole('button', { name: /clear overrides for the week of 7 – 11 sep 2026/i }),
+    );
+    const alertDialog = screen.getByRole('alertdialog');
+    await userEvent.click(within(alertDialog).getByRole('button', { name: /^clear overrides$/i }));
+
+    expect(update).toHaveBeenCalledTimes(1);
+    // The week-of-14-Sep override survives; only 7-Sep's is gone.
+    expect(update.mock.calls[0]?.[0]?.overrides).toEqual([
+      { personId: 'mgr', date: '2026-09-14', otlProjectCode: 'OPEX-ADMIN', hours: 3 },
+    ]);
+  });
+});
+
 const capex: Otl = {
   ...opex, projectCode: 'P-1', category: 'CAPEX', isDefaultOpex: false, colorIndex: 1,
 };
