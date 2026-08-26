@@ -13,7 +13,7 @@
  * typed; on blur the cell's residual (the part past the last half-hour) is
  * named in Supporting text so it never reads as a generic warning banner.
  */
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 import {
   Table,
   TableHeader,
@@ -144,6 +144,7 @@ export function AllocationGrid({ model, month, update }: AllocationGridProps) {
   function renderCell(personId: PersonId | null, personLabel: string, otlProjectCode: string) {
     const key = cellKey(personId, otlProjectCode);
     const residual = residuals[key];
+    const isZero = cellValue(personId, otlProjectCode) === 0;
     return (
       <TableCell key={otlProjectCode} style={{ textAlign: 'right' }} className="tabular">
         <NumberInput
@@ -155,6 +156,14 @@ export function AllocationGrid({ model, month, update }: AllocationGridProps) {
           formatValue={formatHoursCell}
           step={0.5}
           min={0}
+          // DESIGN.md §2.2/§6: a zeroed cell renders as an em-dash in the
+          // disabled color, never black "0.0" text. NumberInput has no
+          // `color`/zero-state prop of its own — its input text is styled
+          // via `color: var(--color-text-primary)` (NumberInput.tsx), so
+          // re-scoping that one custom property on the wrapper is the
+          // smallest change that reaches it, rather than reimplementing the
+          // component's text rendering to add a prop it doesn't expose.
+          style={isZero ? ({ '--color-text-primary': 'var(--color-text-disabled)' } as CSSProperties) : undefined}
         />
         {residual != null && (
           // Supporting-scale helper text naming the exact residual — not the
