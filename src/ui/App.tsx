@@ -49,6 +49,21 @@ function currentMonth(): IsoMonth {
  * necessarily general — still a statement of fact, never "Oops". */
 const STALE_REASON = 'The schedule changed since the last recalculation — results are out of date.';
 
+/** Names what went stale when recalculation cannot clear it.
+ *
+ * A model that was never scheduled and has nothing allocated is an empty
+ * state, and `needsAllocation` rightly keeps the nag off it. A model that WAS
+ * scheduled and then had its allocations removed is a different thing: the
+ * backend still holds the schedule rows, `Meta` still certifies the old hash,
+ * and the Weeks page recomputes from the current model — so the sheet and the
+ * screen disagree. Suppressing both the banner and the action there was
+ * silent staleness. The banner stays; the action, which still cannot succeed,
+ * does not. */
+const UNCLEARABLE_STALE_REASON =
+  'The stored schedule no longer matches the model, and it cannot be rebuilt: the model has ' +
+  'no allocated months to place hours into. Add an allocation on the Allocations tab for the ' +
+  'month you are planning, then recalculate.';
+
 /** What to do about a domain constraint the renderer could not satisfy.
  * The thrown message names the constraint (DESIGN.md §4 "Errors"); this
  * names the move that clears it.
@@ -199,8 +214,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
 export function App() {
   const {
-    model, isStale, needsAllocation, status, notice, dataNotice, unreadableTabs,
-    update, cancelPendingPush, recalculate, config, connect,
+    model, isStale, needsAllocation, hasCertifiedSchedule, status, notice, dataNotice,
+    unreadableTabs, update, cancelPendingPush, recalculate, config, connect,
   } = useStore();
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -230,12 +245,21 @@ export function App() {
   // named where it can be acted on (AllocationsPage), not a stale schedule.
   const canRecalculate = isStale && !needsAllocation;
 
+  // Hiding the action is right; hiding the FACT is not, once a schedule has
+  // actually been certified. Then the stored schedule and the model really
+  // have diverged, and only the banner can say so.
+  const staleReason = canRecalculate
+    ? STALE_REASON
+    : isStale && needsAllocation && hasCertifiedSchedule
+      ? UNCLEARABLE_STALE_REASON
+      : null;
+
   const bannerPlan = planNoticeBanner({
     dataNotice,
     hasUnreadableTab: unreadableTabs.length > 0,
     notice,
     status,
-    staleReason: canRecalculate ? STALE_REASON : null,
+    staleReason,
   });
 
   return (
@@ -280,9 +304,9 @@ export function App() {
                 />
               ) : (
                 <StaleBanner
-                  isStale={canRecalculate}
-                  reason={STALE_REASON}
-                  onRecalculate={recalculate}
+                  isStale={staleReason !== null}
+                  reason={staleReason ?? STALE_REASON}
+                  onRecalculate={canRecalculate ? recalculate : undefined}
                 />
               )}
               <TabList

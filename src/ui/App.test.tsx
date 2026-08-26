@@ -447,3 +447,47 @@ describe('App: no allocated month is an empty state, not a permanent nag', () =>
     expect(screen.getByRole('button', { name: /recalculate/i })).toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// N4 regression: `needsAllocation` is the right empty state for a model that
+// was NEVER scheduled. For one that WAS scheduled and then had its
+// allocations removed it over-suppressed BOTH the banner and the action —
+// while the backend still held the schedule rows and `Meta` still certified
+// the old hash, and WeeksPage recomputed from the current model. The screen
+// and the sheet disagreed, with nothing saying so. Silent staleness is this
+// project's named recurring failure mode.
+// ---------------------------------------------------------------------------
+
+/** The same model, but a schedule WAS calculated for it once: `Meta`
+ *  certifies a hash, and the `Schedule` tab holds the rows it certifies.
+ *  Then the allocations went away. */
+const CERTIFIED_THEN_UNALLOCATED = {
+  ...NOTHING_ALLOCATED,
+  Schedule: [
+    ['personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks'],
+    ['p1', '2026-09-07', 'OPEX-ADMIN', '2', 'OVERRIDE', '2'],
+  ],
+  Meta: [['key', 'value'], ['modelHash', 'the-hash-it-was-scheduled-against']],
+};
+
+describe('App: a certified schedule that lost its allocations still says so', () => {
+  it('keeps a banner up naming the missing allocation, without offering Recalculate', async () => {
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(CERTIFIED_THEN_UNALLOCATED));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText(/stored schedule no longer matches/i)).toBeInTheDocument();
+    // The action still cannot succeed, so it is still not offered.
+    expect(screen.queryByRole('button', { name: /recalculate/i })).not.toBeInTheDocument();
+  });
+
+  it('names the allocation that is missing, so the banner is actionable', async () => {
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(CERTIFIED_THEN_UNALLOCATED));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText(/no allocated months/i)).toBeInTheDocument();
+  });
+});
