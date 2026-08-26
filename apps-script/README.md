@@ -62,8 +62,31 @@ deployment.
 The script reads and writes eight tabs by name: `OTLs`, `People`,
 `StatHolidays`, `Allocations`, `Leave`, `Overrides`, `Schedule`, `Meta`. You
 don't need to create these tabs yourself — the first write from Timesheet
-Helper creates any that are missing, sets bold header rows, and freezes row 1.
-If a tab doesn't exist yet when the app reads, it's simply treated as empty.
+Helper creates any that are missing, sets bold header rows, freezes row 1, and
+protects the header row. If a tab doesn't exist yet when the app reads, it's
+simply treated as empty.
+
+### Protected header rows
+
+Timesheet Helper matches each tab's header row against the column names it
+expects. If the header doesn't match, the app cannot tell which column is
+which, so it reads nothing from that tab — a single renamed column (`role` to
+`Role`) is enough to hide every person from the app.
+
+Each write therefore protects the header row of the tab it wrote, with a
+warning: editing row 1 now raises a "you're editing a protected range"
+confirmation instead of just happening. You can still edit it — you own the
+Sheet — but not by accident.
+
+If the app reports that a tab could not be read, restore that tab's header row
+to exactly the column names the app writes (the fastest way is to look at
+another copy, or delete the whole tab and let the next write recreate it). The
+app will not overwrite a tab it cannot read, so your rows are still there while
+you fix the header.
+
+**This protection only appears once you redeploy** — see step 4. An existing
+deployment keeps running the code version it was deployed with, so a Sheet set
+up before this change has unprotected headers until you push a new version.
 
 ## 6. Troubleshooting
 
@@ -75,3 +98,10 @@ If a tab doesn't exist yet when the app reads, it's simply treated as empty.
   version** after any script edit (see step 4).
 - **Changes to the script aren't showing up:** see step 4 — you edited but
   didn't create a new deployment version.
+- **The app says a tab could not be read:** its header row no longer matches
+  the column names the app writes. Nothing is lost — the app refuses to write
+  over a tab it cannot read — so fix row 1 and reload the app (see
+  "Protected header rows" in step 5).
+- **Row 1 lets you edit it with no warning:** the header protection ships with
+  the script, and an existing deployment runs the code version it was deployed
+  with. Redeploy a new version (step 4), then let the app save once.
