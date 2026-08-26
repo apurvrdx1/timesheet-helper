@@ -1,11 +1,12 @@
 import type { Model } from './types';
+import { cmp } from './order';
 
 /** Order-insensitive: sorting means reordering a table is not a change. */
 function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).sort().join(',')}]`;
+  if (Array.isArray(value)) return `[${value.map(canonical).sort(cmp).join(',')}]`;
   if (value && typeof value === 'object') {
     return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([a], [b]) => a.localeCompare(b))
+      .sort(([a], [b]) => cmp(a, b))
       .map(([k, v]) => `${k}:${canonical(v)}`)
       .join(',')}}`;
   }
