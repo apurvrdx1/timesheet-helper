@@ -246,3 +246,43 @@ describe('ErrorBoundary', () => {
     expect(screen.getByText('the real page')).toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// N5 regression: RECOVERY_HINT promises "Your data is safe — nothing was
+// saved over", but the boundary did not cancel the store's pending 2s
+// debounce, so the write the failing render was heading towards still
+// landed. And it sent the user to "the Setup tab" even when Setup was the
+// tab that had just failed.
+// ---------------------------------------------------------------------------
+
+describe('ErrorBoundary: the promise it makes is backed by what it does', () => {
+  it('cancels the pending push so nothing is saved over', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onError = vi.fn();
+
+    render(
+      <ErrorBoundary onError={onError}>
+        <Boom />
+      </ErrorBoundary>,
+    );
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/nothing was saved over/i)).toBeInTheDocument();
+    consoleError.mockRestore();
+  });
+
+  it('does not send the user to the Setup tab when Setup is the tab that failed', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    render(
+      <ErrorBoundary isRecoveryPage>
+        <Boom />
+      </ErrorBoundary>,
+    );
+
+    expect(screen.queryByText(/setup tab/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/on this page/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+    consoleError.mockRestore();
+  });
+});

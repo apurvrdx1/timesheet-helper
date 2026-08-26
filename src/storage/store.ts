@@ -45,6 +45,13 @@ export interface StoreApi {
    */
   unreadableTabs: readonly TabName[];
   update: (fn: (model: Model) => Model) => void;
+  /**
+   * Drops a push that `update` has queued on the debounce timer but not yet
+   * sent. The one caller is the render error boundary: it tells the user
+   * "nothing was saved over", and that sentence is only true if the write
+   * the failing render was heading towards never leaves.
+   */
+  cancelPendingPush: () => void;
   recalculate: () => void;
   connect: (config: BackendConfig) => Promise<void>;
   disconnect: () => Promise<void>;
@@ -362,6 +369,12 @@ export function useStore(): StoreApi {
     [pushToAdapter],
   );
 
+  const cancelPendingPush = useCallback((): void => {
+    if (debounceRef.current === null) return;
+    clearTimeout(debounceRef.current);
+    debounceRef.current = null;
+  }, []);
+
   const recalculate = useCallback(() => {
     const currentModel = modelRef.current;
     // `scheduleAll` throws on a model the scheduler can't yet make sense of
@@ -477,6 +490,7 @@ export function useStore(): StoreApi {
     dataNotice,
     unreadableTabs,
     update,
+    cancelPendingPush,
     recalculate,
     connect,
     disconnect,

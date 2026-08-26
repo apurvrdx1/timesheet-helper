@@ -606,3 +606,36 @@ describe('useStore: Meta never certifies a Schedule that was not written', () =>
     expect(pushed && 'Meta' in pushed).toBe(true);
   });
 });
+
+describe('useStore: cancelPendingPush', () => {
+  it('drops a queued push so the debounced write never leaves', async () => {
+    vi.useFakeTimers();
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    act(() => {
+      result.current.cancelPendingPush();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+
+  it('is safe to call when nothing is queued', async () => {
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(() => {
+      act(() => {
+        result.current.cancelPendingPush();
+      });
+    }).not.toThrow();
+  });
+});

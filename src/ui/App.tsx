@@ -50,12 +50,30 @@ const STALE_REASON = 'The schedule changed since the last recalculation — resu
 
 /** What to do about a domain constraint the renderer could not satisfy.
  * The thrown message names the constraint (DESIGN.md §4 "Errors"); this
- * names the move that clears it. */
-const RECOVERY_HINT =
+ * names the move that clears it.
+ *
+ * "Nothing was saved over" is a promise, so the boundary keeps it: catching
+ * cancels the pending debounced push (`onError`) rather than letting the
+ * write the failing render was heading towards land two seconds later.
+ *
+ * The move itself depends on where the user already is. Sending someone
+ * standing on Setup to "the Setup tab" is a dead end — that is the tab that
+ * just failed to render. */
+const RECOVERY_HINT_ELSEWHERE =
   'Your data is safe — nothing was saved over. Fix the cause on the Setup tab, then press Try again.';
+
+const RECOVERY_HINT_HERE =
+  'Your data is safe — nothing was saved over. Fix the cause in the data on this page, then press Try again.';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
+  /**
+   * True when the failing page IS the one the recovery hint would otherwise
+   * point at, so the hint must not send the user to where they already are.
+   */
+  isRecoveryPage?: boolean;
+  /** Called once when a render error is caught, before anything is shown. */
+  onError?: () => void;
 }
 
 interface ErrorBoundaryState {
@@ -82,6 +100,10 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   override componentDidCatch(error: unknown, info: ErrorInfo): void {
+    // Before anything else: make "nothing was saved over" true. A push may
+    // already be sitting on the store's 2s debounce, aimed at the very
+    // model the failing render could not make sense of.
+    this.props.onError?.();
     // The screen gets the constraint; the console gets the detail needed to
     // debug it. Same split the store uses for load problems.
     // eslint-disable-next-line no-console
@@ -100,7 +122,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       <Banner
         status="error"
         title={`This view could not be built: ${message}`}
-        description={RECOVERY_HINT}
+        description={this.props.isRecoveryPage === true ? RECOVERY_HINT_HERE : RECOVERY_HINT_ELSEWHERE}
         collapsible={false}
         endContent={<Button label="Try again" variant="primary" onClick={this.retry} />}
       />
@@ -109,8 +131,10 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 }
 
 export function App() {
-  const { model, isStale, status, notice, dataNotice, update, recalculate, config, connect } =
-    useStore();
+  const {
+    model, isStale, status, notice, dataNotice,
+    update, cancelPendingPush, recalculate, config, connect,
+  } = useStore();
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   // ConnectionSettings is a controlled form: it reports edits via `onChange`
@@ -205,7 +229,11 @@ export function App() {
                   and remounts that page: the way out of a domain constraint
                   is almost always Setup, and the boundary must not stand
                   between the user and it. */}
-              <ErrorBoundary key={activeTab}>
+              <ErrorBoundary
+                key={activeTab}
+                isRecoveryPage={activeTab === 'setup'}
+                onError={cancelPendingPush}
+              >
                 {activeTab === 'setup' && <SetupPage model={model} update={update} />}
                 {activeTab === 'allocations' && (
                   <AllocationsPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
