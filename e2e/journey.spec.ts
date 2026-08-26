@@ -113,13 +113,24 @@ test('setup to timesheet, end to end', async ({ page }) => {
   // --- Override a cell: it locks, and survives a second recalculation —
   //     the behaviour that was genuinely broken until recently.
 
+  // The manager carries no CAPEX, so this first cell is the default OPEX
+  // code — the one case where the optimizer tops a pin back up to a full
+  // 7.5h day. The cell total and the pinned figure therefore differ, and
+  // asserting only that the padlock is still there would pass even if the
+  // 4.0h pin had been silently replaced by the 7.5h the day adds up to.
   const cell = page.getByRole('spinbutton').first();
   await cell.fill('4');
   await cell.press('Enter');
   await expect(page.getByLabel(/manually set/i).first()).toBeVisible();
+  await expect(page.getByLabel(/4\.0h manually set/i).first()).toBeVisible();
 
   await recalculate.click();
   await expect(page.getByLabel(/manually set/i).first()).toBeVisible();
+  // The value itself, not just its marker: clicking Recalculate blurred the
+  // field, so what it shows now is the committed override, and it is still
+  // the 4.0h that was typed rather than the day total it sits inside.
+  await expect(cell).toHaveValue('4.0');
+  await expect(page.getByLabel(/4\.0h manually set/i).first()).toBeVisible();
 
   // --- A person's read-off view shows their week.
 
