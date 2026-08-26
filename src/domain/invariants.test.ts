@@ -231,6 +231,43 @@ describe('checkInvariants', () => {
         (v) => v.kind === 'OPEX_FLOOR_BREACHED' && v.scope === '2026-09-07')).toBe(false);
     });
 
+    it('rejects a non-integer or non-positive block count', () => {
+      const bad: ScheduleResult = {
+        entries: [{
+          personId: 'p1', date: '2026-09-07', otlProjectCode: 'P-1001',
+          blocks: 2.5, source: 'CALC', overrideBlocks: 0,
+        }],
+        residuals: [], violations: [],
+      };
+      expect(checkInvariants(soloModel(), bad, ['2026-09'])
+        .some((v) => v.kind === 'NEGATIVE' && v.message.includes('2.5 blocks'))).toBe(true);
+    });
+
+    it('rejects a leave day carrying anything other than one LEAVE entry', () => {
+      const model = soloModel({
+        otls: [opex, capexOtl('P-1001'), leaveOtl],
+        leave: [{
+          personId: 'p1', startDate: '2026-09-07', endDate: '2026-09-07',
+          otlProjectCode: 'VAC-01',
+        }],
+      });
+      const bad: ScheduleResult = {
+        entries: [
+          {
+            personId: 'p1', date: '2026-09-07', otlProjectCode: 'VAC-01',
+            blocks: 11, source: 'LEAVE', overrideBlocks: 0,
+          },
+          {
+            personId: 'p1', date: '2026-09-07', otlProjectCode: 'P-1001',
+            blocks: 4, source: 'CALC', overrideBlocks: 0,
+          },
+        ],
+        residuals: [], violations: [],
+      };
+      expect(checkInvariants(model, bad, ['2026-09']).some(
+        (v) => v.kind === 'DAY_NOT_FULL' && v.message.includes('holds 2 entries'))).toBe(true);
+    });
+
     it('rejects an entry claiming more override blocks than it holds', () => {
       const bad: ScheduleResult = {
         entries: [{

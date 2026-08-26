@@ -295,6 +295,11 @@ describe('scheduleAll', () => {
       .toBe(JSON.stringify(scheduleAll(m, ['2026-09']).violations));
   });
 
+  it('refuses to schedule a model with no default OPEX code', () => {
+    expect(() => scheduleAll(model({ otls: [capex('P-1001', 1)] }), ['2026-09']))
+      .toThrow(/default OPEX/);
+  });
+
   it('never double-books a day across overlapping month views', () => {
     const r = scheduleAll(model({
       allocations: [{ month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 40 }],
