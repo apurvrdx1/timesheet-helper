@@ -6,11 +6,27 @@ import { ConnectionSettings } from './ConnectionSettings';
 const google = { backend: 'google' as const, location: '', secret: '' };
 
 describe('ConnectionSettings', () => {
-  it('offers all three backends', () => {
+  it('offers all three backends', async () => {
     render(<ConnectionSettings config={google} onChange={vi.fn()} onConnect={vi.fn()} />);
-    expect(screen.getByRole('option', { name: /google/i })).toBeInTheDocument();
+    // Astryx's Selector only exposes its option-role children while open, and
+    // is not a native <select> — a real user opens the combobox trigger, then
+    // sees the options; that is what we drive here rather than forcing the
+    // popup open via a test-only prop. `getByRole('combobox', ...)` is used
+    // (not `getByLabelText`) because a closed Selector still pre-mounts its
+    // listbox off the accessibility tree but still in the DOM, which makes
+    // `getByLabelText` resolve ambiguously.
+    await userEvent.click(screen.getByRole('combobox', { name: /backend/i }));
+    expect(await screen.findByRole('option', { name: /google/i })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: /microsoft/i })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: /this browser/i })).toBeInTheDocument();
+  });
+
+  it('switches backends when a different option is chosen', async () => {
+    const onChange = vi.fn();
+    render(<ConnectionSettings config={google} onChange={onChange} onConnect={vi.fn()} />);
+    await userEvent.click(screen.getByRole('combobox', { name: /backend/i }));
+    await userEvent.click(await screen.findByRole('option', { name: /microsoft/i }));
+    expect(onChange).toHaveBeenCalledWith({ ...google, backend: 'microsoft' });
   });
 
   it('asks for a script url and secret for Google', () => {

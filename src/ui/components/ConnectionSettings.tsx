@@ -91,7 +91,6 @@ export function ConnectionSettings({
                 options={backendOptions}
                 value={config.backend}
                 onChange={handleBackendChange}
-                isDefaultOpen
               />
               {notice && (
                 <Banner
