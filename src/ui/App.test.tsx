@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { App } from './App';
+import { App, ErrorBoundary } from './App';
 
 // jsdom (this project's `src/test-setup.ts`, which this file must not edit
 // per the storage-isolation constraint other page tests document) does not
@@ -184,5 +184,65 @@ describe('App', () => {
     // The week is still expanded — opening/closing the read-off view didn't
     // reset the accordion.
     expect(screen.getByRole('table', { name: /manager/i })).toBeInTheDocument();
+  });
+});
+
+/** The local adapter's own storage key — the backend App reads through on
+ * mount, not the client-side cache. */
+const LOCAL_ADAPTER_KEY = 'timesheet-helper:payload:v1';
+
+describe('App: a data-integrity problem is never suppressed', () => {
+  it('shows the unreadable tab and the Recalculate action in one banner', async () => {
+    // One capital R in the People header: the whole tab drops, and the Meta
+    // hash was written against the intact model, so the schedule reads as
+    // stale on exactly this load. The user used to see the stale banner and
+    // nothing at all about the tab that had just vanished.
+    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify({
+      People: [['id', 'name', 'Role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
+    }));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText(/People tab could not be read/i)).toBeInTheDocument();
+    expect(screen.getByText(/will not write over it/i)).toBeInTheDocument();
+    // Merged, not stacked (DESIGN.md §3): the stale message and its action
+    // ride along in the same banner.
+    expect(screen.getByText(/out of date/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /recalculate/i })).toBeInTheDocument();
+  });
+});
+
+function Boom(): never {
+  throw new Error('No OTL is flagged as the default OPEX code.');
+}
+
+describe('ErrorBoundary', () => {
+  it('turns a domain throw into a readable, actionable message instead of a blank page', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    render(
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
+    );
+
+    // The constraint the domain named, and the move that clears it — not a
+    // stack trace (DESIGN.md §4).
+    expect(screen.getByText(/no otl is flagged as the default opex code/i)).toBeInTheDocument();
+    expect(screen.getByText(/setup tab/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+    expect(screen.queryByText(/\bat Boom\b/)).not.toBeInTheDocument();
+
+    consoleError.mockRestore();
+  });
+
+  it('renders its children untouched when nothing throws', () => {
+    render(
+      <ErrorBoundary>
+        <p>the real page</p>
+      </ErrorBoundary>,
+    );
+    expect(screen.getByText('the real page')).toBeInTheDocument();
   });
 });

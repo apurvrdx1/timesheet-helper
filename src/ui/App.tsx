@@ -3,7 +3,8 @@
  * recalculation banner, and the per-tab content area. Each tab renders its
  * real page — SetupPage, AllocationsPage, WeeksPage — wired to `useStore()`.
  */
-import { useCallback, useState } from 'react';
+import { Component, useCallback, useState } from 'react';
+import type { ErrorInfo, ReactNode } from 'react';
 import { Theme } from '@astryxdesign/core/theme';
 import { neutralTheme } from '@astryxdesign/theme-neutral/built';
 import { Section } from '@astryxdesign/core/Section';
@@ -47,8 +48,69 @@ function currentMonth(): IsoMonth {
  * necessarily general — still a statement of fact, never "Oops". */
 const STALE_REASON = 'The schedule changed since the last recalculation — results are out of date.';
 
+/** What to do about a domain constraint the renderer could not satisfy.
+ * The thrown message names the constraint (DESIGN.md §4 "Errors"); this
+ * names the move that clears it. */
+const RECOVERY_HINT =
+  'Your data is safe — nothing was saved over. Fix the cause on the Setup tab, then press Try again.';
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  message: string | null;
+}
+
+/**
+ * The app's last line of defence. `src/domain/` throws deliberately on a
+ * model it cannot make sense of (no OTL flagged as the default OPEX code
+ * being the reachable case), and every one of those throws is reachable
+ * from a render path. Without a boundary, React unmounts the whole tree and
+ * the user gets a blank page with no way back — for a data problem the
+ * model itself tolerates.
+ *
+ * Renders the constraint the domain named plus the action that clears it,
+ * never a stack trace, and keeps the header, tabs and connection settings
+ * alive around it so the user can go and fix the cause.
+ */
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  override state: ErrorBoundaryState = { message: null };
+
+  static getDerivedStateFromError(error: unknown): ErrorBoundaryState {
+    return { message: error instanceof Error ? error.message : String(error) };
+  }
+
+  override componentDidCatch(error: unknown, info: ErrorInfo): void {
+    // The screen gets the constraint; the console gets the detail needed to
+    // debug it. Same split the store uses for load problems.
+    // eslint-disable-next-line no-console
+    console.error('A render failed:', error, info.componentStack);
+  }
+
+  private readonly retry = (): void => {
+    this.setState({ message: null });
+  };
+
+  override render(): ReactNode {
+    const { message } = this.state;
+    if (message === null) return this.props.children;
+
+    return (
+      <Banner
+        status="error"
+        title={`This view could not be built: ${message}`}
+        description={RECOVERY_HINT}
+        collapsible={false}
+        endContent={<Button label="Try again" variant="primary" onClick={this.retry} />}
+      />
+    );
+  }
+}
+
 export function App() {
-  const { model, isStale, status, notice, update, recalculate, config, connect } = useStore();
+  const { model, isStale, status, notice, dataNotice, update, recalculate, config, connect } =
+    useStore();
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   // ConnectionSettings is a controlled form: it reports edits via `onChange`
@@ -89,20 +151,45 @@ export function App() {
           }
           content={
             <LayoutContent>
-              <StaleBanner
-                isStale={isStale}
-                reason={STALE_REASON}
-                onRecalculate={recalculate}
-              />
-              {/* One banner at a time (DESIGN.md §3): a connectivity notice only
-                  shows once the stale banner — the higher-priority, more actionable
-                  message — isn't already occupying the slot. */}
-              {!isStale && notice && (
+              {/* One banner at a time (DESIGN.md §3) — merged, never stacked.
+                  A data-integrity problem outranks everything else: it means
+                  the spreadsheet holds data the app cannot see, and only the
+                  user can fix it. So it takes the title, the other live
+                  messages fall in behind it as the description, and the
+                  Recalculate action stays attached when the schedule is stale
+                  too. Suppressing it behind the stale banner (which is up on
+                  exactly this load, because Meta's hash was written against
+                  the intact model) is how the user used to never hear about
+                  it at all. */}
+              {dataNotice !== null ? (
                 <Banner
-                  status={status === 'error' || status === 'offline' ? 'error' : 'info'}
-                  title={notice}
+                  status="error"
+                  title={dataNotice}
+                  description={[isStale ? STALE_REASON : null, notice]
+                    .filter((message): message is string => message !== null && message !== '')
+                    .join(' ')}
                   collapsible={false}
+                  endContent={
+                    isStale ? (
+                      <Button label="Recalculate" variant="primary" onClick={recalculate} />
+                    ) : undefined
+                  }
                 />
+              ) : (
+                <>
+                  <StaleBanner
+                    isStale={isStale}
+                    reason={STALE_REASON}
+                    onRecalculate={recalculate}
+                  />
+                  {!isStale && notice && (
+                    <Banner
+                      status={status === 'error' || status === 'offline' ? 'error' : 'info'}
+                      title={notice}
+                      collapsible={false}
+                    />
+                  )}
+                </>
               )}
               <TabList
                 value={activeTab}
@@ -114,13 +201,19 @@ export function App() {
                   <Tab key={tab.value} value={tab.value} label={tab.label} />
                 ))}
               </TabList>
-              {activeTab === 'setup' && <SetupPage model={model} update={update} />}
-              {activeTab === 'allocations' && (
-                <AllocationsPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
-              )}
-              {activeTab === 'weeks' && (
-                <WeeksPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
-              )}
+              {/* Keyed by tab so moving to another tab clears a caught error
+                  and remounts that page: the way out of a domain constraint
+                  is almost always Setup, and the boundary must not stand
+                  between the user and it. */}
+              <ErrorBoundary key={activeTab}>
+                {activeTab === 'setup' && <SetupPage model={model} update={update} />}
+                {activeTab === 'allocations' && (
+                  <AllocationsPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
+                )}
+                {activeTab === 'weeks' && (
+                  <WeeksPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
+                )}
+              </ErrorBoundary>
             </LayoutContent>
           }
         />
