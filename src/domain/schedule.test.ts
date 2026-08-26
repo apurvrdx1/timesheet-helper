@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { mondayOf } from './calendar';
 import { scheduleAll } from './schedule';
 import type { Model, Otl } from './types';
 
@@ -83,6 +84,51 @@ describe('scheduleAll', () => {
     }), ['2026-09']);
     expect(hoursOn(r, 'p1', 'STAT-01')).toBe(7.5);
     expect(hoursOn(r, 'mgr', 'STAT-01')).toBe(7.5);
+  });
+
+  it('does not manufacture a residual for someone who took leave (N4)', () => {
+    // Alex is off the whole week of 7 Sep. The remaining 17 September
+    // workdays hold this allocation comfortably. Pacing used to decrement its
+    // runway only by NON-leave days, so the runway stayed inflated by the 5
+    // leave days, `monthDays > weekDays` never stopped holding, the final
+    // week never took the whole remaining balance, and the leftover surfaced
+    // as a residual reporting a capacity shortfall that does not exist.
+    const withLeave = model({
+      otls: [opex, capex('P-1001', 1), {
+        projectCode: 'VAC-01', taskCode: 'T9', expenditureTypeCode: 'E9',
+        timeReportingCode: 'R9', category: 'LEAVE', leaveSubtype: 'VACATION',
+        isDefaultOpex: false, colorIndex: 0, active: true,
+      }],
+      leave: [{
+        personId: 'p1', startDate: '2026-09-07', endDate: '2026-09-11',
+        otlProjectCode: 'VAC-01',
+      }],
+      allocations: [
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 50 },
+      ],
+    });
+    const r = scheduleAll(withLeave, ['2026-09']);
+    expect(hoursOn(r, 'p1', 'P-1001')).toBe(50);
+    expect(r.residuals).toEqual([]);
+    // ...and nothing cascaded to the manager either.
+    expect(hoursOn(r, 'mgr', 'P-1001')).toBe(0);
+  });
+
+  it('paces a month across its weeks rather than front-loading it', () => {
+    // The runway fix must not turn pacing into "spend it all in week one".
+    const r = scheduleAll(model({
+      allocations: [
+        { month: '2026-09', otlProjectCode: 'P-1001', personId: 'p1', hours: 60 },
+      ],
+    }), ['2026-09']);
+    const mine = r.entries.filter(
+      (e) => e.personId === 'p1' && e.otlProjectCode === 'P-1001');
+    expect(hoursOn(r, 'p1', 'P-1001')).toBe(60);
+    // 60h is 120 blocks, so it cannot fit in fewer than 8 days; but the CAPEX
+    // ceiling is 45 blocks a week, so it also cannot fit in fewer than 3
+    // weeks. Front-loading would show up as a small handful of days.
+    const mondays = new Set(mine.map((e) => mondayOf(e.date)));
+    expect(mondays.size).toBeGreaterThanOrEqual(3);
   });
 
   it('is deterministic across runs', () => {

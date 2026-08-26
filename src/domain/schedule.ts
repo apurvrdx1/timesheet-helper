@@ -44,7 +44,15 @@ function schedulePerson(
     const dates = weekDays(monday);
     const leaveDates = leaveDatesFor(personId, dates, model);
     const workDates = dates.filter((d) => !leaveDates.has(d));
+    // This week's actual capacity, so pacing asks for a slice this person can
+    // really absorb: leave days are excluded.
     const weekCounts = workdayCountsByMonth(workDates);
+    // How much runway this week burns, which is every workday of the month it
+    // contains — leave days included. A leave day is spent whether or not it
+    // could hold CAPEX, and a runway that ignores them stays permanently
+    // inflated, so `monthDays > weekDays` never stops holding and pacing never
+    // takes the whole remaining balance in the month's final week.
+    const runwayCounts = workdayCountsByMonth(dates);
 
     const demand: DemandItem[] = pacedDemand(remaining, dates, runway, weekCounts);
 
@@ -61,7 +69,7 @@ function schedulePerson(
     for (const [key, blocks] of out.consumed) {
       remaining.set(key, Math.max(0, (remaining.get(key) ?? 0) - blocks));
     }
-    for (const [month, count] of weekCounts) {
+    for (const [month, count] of runwayCounts) {
       runway.set(month, Math.max(0, (runway.get(month) ?? 0) - count));
     }
   }
