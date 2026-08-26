@@ -26,6 +26,7 @@ import { Icon } from '@astryxdesign/core/Icon';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { Text } from '@astryxdesign/core/Text';
 import { HStack } from '@astryxdesign/core/HStack';
+import { Badge } from '@astryxdesign/core/Badge';
 import { formatHoursCell } from '../format';
 import type { EntrySource, IsoDate, OtlCode, PersonId } from '../../domain/types';
 
@@ -37,6 +38,14 @@ export interface HourCellProps {
   source: EntrySource;
   onOverride: (hours: number) => void;
   onRevert: () => void;
+  /**
+   * The leave subtype label (e.g. "Vacation"), when this cell's hours are a
+   * leave booking. Optional and additive to the verbatim task-19 test
+   * fixture, which never passes it: DESIGN.md §2.1 asks for a
+   * warning-muted day column plus a subtype Badge on a leave day, and
+   * `source === 'LEAVE'` alone doesn't carry which subtype.
+   */
+  leaveSubtype?: string | null;
 }
 
 const LOCK_TOOLTIP = 'Manually set — recalculation will preserve this';
@@ -54,7 +63,9 @@ function LockGlyph(props: SVGProps<SVGSVGElement>) {
   );
 }
 
-export function HourCell({ personId, date, otlProjectCode, hours, source, onOverride, onRevert }: HourCellProps) {
+export function HourCell({
+  personId, date, otlProjectCode, hours, source, onOverride, onRevert, leaveSubtype,
+}: HourCellProps) {
   const isLeave = source === 'LEAVE';
   const isOverride = source === 'OVERRIDE';
   const isZero = hours === 0;
@@ -77,10 +88,16 @@ export function HourCell({ personId, date, otlProjectCode, hours, source, onOver
 
   if (isLeave) {
     return (
-      <TableCell className="tabular" style={{ textAlign: 'right' }}>
-        <Text type="body" color={isZero ? 'disabled' : undefined}>
-          {formatHoursCell(hours)}
-        </Text>
+      <TableCell
+        className="tabular"
+        style={{ textAlign: 'right', backgroundColor: 'var(--color-warning-muted)' }}
+      >
+        <HStack gap={1} vAlign="center" hAlign="end">
+          {leaveSubtype && <Badge variant="warning" label={leaveSubtype} />}
+          <Text type="body" color={isZero ? 'disabled' : undefined}>
+            {formatHoursCell(hours)}
+          </Text>
+        </HStack>
       </TableCell>
     );
   }
