@@ -87,6 +87,11 @@ const STATUS_WORD: Record<StatusDotVariant, string> = {
  * and `AllocationGrid` already use. Counting stat holidays by hand (which is
  * all this did) advertised 37.5h for a week somebody spent three days of it
  * on vacation, while the optimizer was working to 30.0h.
+ *
+ * A team of more than one always reads as more than 37.5h — everyone in
+ * this domain thinks in single-person 37.5h weeks, so the header must say
+ * "team capacity" rather than a bare "Nh capacity" that a manager could
+ * mistake for one person's (impossible) week.
  */
 function weekCapacityHours(weekDates: IsoDate[], model: Model): number {
   return model.people.reduce((hours, person) => {
@@ -139,7 +144,7 @@ export function WeekAccordion({
                 <HStack gap={3} vAlign="center">
                   <Text type="body" weight="semibold">{formatWeekRange(monday)}</Text>
                   <Text type="supporting" color="secondary">
-                    {`${capacityHours.toFixed(1)}h capacity`}
+                    {`team capacity ${capacityHours.toFixed(1)}h`}
                   </Text>
                   <StatusDot
                     variant={status}

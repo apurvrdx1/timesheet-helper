@@ -183,6 +183,6 @@ describe('WeeksPage — one continuous schedule (spec §3.4)', () => {
     window.localStorage.clear();
     render(<WeeksPage model={onLeave} month="2026-09" update={vi.fn()} onMonthChange={vi.fn()} />);
     // The manager's full 37.5h plus the two days the report is not on leave.
-    expect(screen.getByText('52.5h capacity')).toBeInTheDocument();
+    expect(screen.getByText('team capacity 52.5h')).toBeInTheDocument();
   });
 });
