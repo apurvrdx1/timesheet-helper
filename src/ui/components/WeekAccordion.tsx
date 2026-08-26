@@ -23,7 +23,7 @@ import { formatWeekRange, weekDays, monthOf } from '../../domain/calendar';
 import { leaveDatesFor, weekCapacity } from '../../domain/capacity';
 import { HOURS_PER_BLOCK } from '../../domain/types';
 import type {
-  IsoDate, IsoMonth, Model, OtlCode, PersonId, ScheduleResult,
+  IsoDate, IsoMonth, Model, OtlCode, Person, PersonId, ScheduleResult,
 } from '../../domain/types';
 
 export interface WeekAccordionProps {
@@ -92,9 +92,16 @@ const STATUS_WORD: Record<StatusDotVariant, string> = {
  * this domain thinks in single-person 37.5h weeks, so the header must say
  * "team capacity" rather than a bare "Nh capacity" that a manager could
  * mistake for one person's (impossible) week.
+ *
+ * Summed over exactly the people the panel RENDERS, never over `model.people`
+ * wholesale. The panel shows a Manager table and a Reports table; the
+ * scheduler deliberately places hours for anyone carrying a role it does not
+ * recognise (schedule.ts, "filtering on role would drop the rest of them from
+ * the schedule entirely"), so summing the whole roster would let such a
+ * person inflate a figure they never appear beneath.
  */
-function weekCapacityHours(weekDates: IsoDate[], model: Model): number {
-  return model.people.reduce((hours, person) => {
+function weekCapacityHours(weekDates: IsoDate[], people: readonly Person[], model: Model): number {
+  return people.reduce((hours, person) => {
     const leaveDates = leaveDatesFor(person.id, weekDates, model);
     return hours + weekCapacity(leaveDates, weekDates) * HOURS_PER_BLOCK;
   }, 0);
@@ -116,6 +123,9 @@ export function WeekAccordion({
 
   const managers = model.people.filter((person) => person.role === 'MANAGER');
   const reports = model.people.filter((person) => person.role === 'REPORT');
+  // The exact roster the two tables below render, and so the exact roster
+  // the header's capacity figure must be summed over.
+  const shownPeople = [...managers, ...reports];
 
   return (
     <>
@@ -123,7 +133,7 @@ export function WeekAccordion({
         {weeks.map((monday) => {
           const dates = weekDays(monday);
           const status = weekStatus(dates, scheduleResult);
-          const capacityHours = weekCapacityHours(dates, model);
+          const capacityHours = weekCapacityHours(dates, shownPeople, model);
           const hasOverrides = model.overrides.some((override) => dates.includes(override.date));
           // Astryx's Collapsible hides a closed panel's content with a CSS
           // class rather than omitting it from the DOM (see its source) —
