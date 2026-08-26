@@ -17,6 +17,15 @@
  * comment whenever custom CSS is used instead of an Astryx primitive) —
  * there is no Astryx "click-anywhere-to-edit" cell primitive to compose
  * instead.
+ *
+ * Two different numbers live in a locked cell and the split matters: `hours`
+ * is the cell's whole figure — the one the user copies into the real
+ * timesheet, and the one the totals row sums — while `overrideHours` is the
+ * part they actually pinned. They differ whenever the optimizer had to top a
+ * pinned default-OPEX cell up to a full 7.5h day. At rest the cell shows the
+ * total, because reading a week off is what the grid is for; the field edits
+ * and commits the pin, because that is what the user owns; and the padlock
+ * names the pin so the total is never mistaken for something the user typed.
  */
 import { useEffect, useRef, useState, type KeyboardEvent, type SVGProps } from 'react';
 import { TableCell } from '@astryxdesign/core/Table';
@@ -34,8 +43,21 @@ export interface HourCellProps {
   personId: PersonId;
   date: IsoDate;
   otlProjectCode: OtlCode;
+  /** The cell's whole figure: what the user copies into the real timesheet. */
   hours: number;
   source: EntrySource;
+  /**
+   * How many of `hours` the user actually pinned, mirroring the domain's
+   * `ScheduleEntry.overrideBlocks`. The two differ in exactly one place: a
+   * pin on the default OPEX code, which phase 4 of the optimizer may still
+   * top up so the day reaches 7.5h. `source` says "lock this cell"; only
+   * this says "the user typed this much", so this — never `hours` — is what
+   * the field edits and what Enter commits on a locked cell.
+   *
+   * Omitted means "the whole cell is the pin", which is what every caller
+   * predating the split assumed and what every non-default-OPEX pin is.
+   */
+  overrideHours?: number;
   onOverride: (hours: number) => void;
   onRevert: () => void;
   /**
@@ -49,6 +71,19 @@ export interface HourCellProps {
 }
 
 const LOCK_TOOLTIP = 'Manually set — recalculation will preserve this';
+
+/**
+ * The same promise, but for a cell the optimizer topped up: it names the
+ * figure the user actually pinned, so the padlock can never be read as a
+ * claim over the whole cell. DESIGN.md §4 asks warnings and explanations to
+ * state the quantity and where it went, and §3 keeps the "recalculation will
+ * preserve this" wording the lock has always carried.
+ */
+function lockTooltipFor(pinned: number, total: number): string {
+  if (pinned >= total) return LOCK_TOOLTIP;
+  return `${pinned.toFixed(1)}h manually set — recalculation will preserve this. ` +
+         `The optimizer added ${(total - pinned).toFixed(1)}h to fill the day.`;
+}
 
 /** No "lock" name exists in the Astryx icon registry (DESIGN.md §3 asks for
  * one); `Icon` accepts a custom SVG component in place of a registry name,
@@ -64,17 +99,22 @@ function LockGlyph(props: SVGProps<SVGSVGElement>) {
 }
 
 export function HourCell({
-  personId, date, otlProjectCode, hours, source, onOverride, onRevert, leaveSubtype,
+  personId, date, otlProjectCode, hours, source, overrideHours, onOverride, onRevert,
+  leaveSubtype,
 }: HourCellProps) {
   const isLeave = source === 'LEAVE';
   const isOverride = source === 'OVERRIDE';
   const isZero = hours === 0;
+  // What the field edits and commits. On a locked cell that is the pin, which
+  // is not always the whole cell; everywhere else the calculated figure is
+  // itself the starting point for an edit.
+  const editedHours = isOverride ? (overrideHours ?? hours) : hours;
 
   // The value last typed (and validated) into the field, kept in a ref
   // rather than state: NumberInput calls onChange and onEnter back-to-back
   // inside the same keydown handler on Enter, so a state read in the Enter
   // handler would still see the stale pre-keystroke render.
-  const lastValidRef = useRef(hours);
+  const lastValidRef = useRef(editedHours);
   // Remounting the NumberInput (via `key`) is how its own internal
   // "pendingInput" buffer — private state this component has no other way
   // to reach — gets cleared on Escape, so the field visibly snaps back to
@@ -83,8 +123,8 @@ export function HourCell({
   const [isFocused, setIsFocused] = useState(false);
 
   useEffect(() => {
-    lastValidRef.current = hours;
-  }, [hours, resetKey]);
+    lastValidRef.current = editedHours;
+  }, [editedHours, resetKey]);
 
   if (isLeave) {
     return (
@@ -113,13 +153,14 @@ export function HourCell({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
     if (event.key !== 'Escape') return;
     event.preventDefault();
-    lastValidRef.current = hours;
+    lastValidRef.current = editedHours;
     setResetKey((count) => count + 1);
     setIsFocused(false);
     onRevert();
   };
 
   const label = `${otlProjectCode} hours for ${personId}, ${date}`;
+  const lockTooltip = lockTooltipFor(editedHours, hours);
 
   return (
     <TableCell
@@ -131,8 +172,8 @@ export function HourCell({
     >
       <HStack gap={1} vAlign="center" hAlign="end">
         {isOverride && (
-          <Tooltip content={LOCK_TOOLTIP}>
-            <Icon icon={LockGlyph} label={LOCK_TOOLTIP} size="xsm" color="accent" />
+          <Tooltip content={lockTooltip}>
+            <Icon icon={LockGlyph} label={lockTooltip} size="xsm" color="accent" />
           </Tooltip>
         )}
         <span style={{ position: 'relative', display: 'inline-block', minWidth: '2.5rem' }}>
@@ -151,7 +192,7 @@ export function HourCell({
             key={resetKey}
             label={label}
             isLabelHidden
-            value={hours}
+            value={editedHours}
             onChange={handleChange}
             onEnter={handleEnter}
             onKeyDown={handleKeyDown}

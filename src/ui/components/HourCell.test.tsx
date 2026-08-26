@@ -55,4 +55,34 @@ describe('HourCell', () => {
     render(<HourCell {...base} source="LEAVE" hours={7.5} />);
     expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
   });
+
+  /**
+   * The regression for the split between `source` (lock this cell) and
+   * `overrideBlocks` (this much was typed). The optimizer may top a pinned
+   * default-OPEX cell up to a full 7.5h day, so the cell total and the pin
+   * legitimately differ — and Enter on a pinned cell must re-commit the pin,
+   * never the total the optimizer arrived at.
+   */
+  it('commits the pinned hours, not the topped-up total, when Enter confirms a locked cell', async () => {
+    const onOverride = vi.fn();
+    render(
+      <HourCell {...base} hours={7.5} source="OVERRIDE" overrideHours={2} onOverride={onOverride} />,
+    );
+    await userEvent.click(screen.getByRole('spinbutton'));
+    await userEvent.keyboard('{Enter}');
+    expect(onOverride).toHaveBeenCalledWith(2);
+  });
+
+  it('reads the cell total at rest while the lock names the hours actually pinned', () => {
+    render(<HourCell {...base} hours={7.5} source="OVERRIDE" overrideHours={2} />);
+    expect(screen.getByText('7.5')).toBeInTheDocument();
+    expect(screen.getByLabelText(/2\.0h manually set/i)).toBeInTheDocument();
+    expect(screen.getByRole('spinbutton')).toHaveValue('2.0');
+  });
+
+  it('keeps the plain lock wording when the whole cell is the pin', () => {
+    render(<HourCell {...base} hours={4} source="OVERRIDE" overrideHours={4} />);
+    expect(screen.getByLabelText('Manually set — recalculation will preserve this')).toBeInTheDocument();
+  });
+
 });

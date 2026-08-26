@@ -166,6 +166,13 @@ export function WeekTable({
                         );
                         const hours = entry ? blocksToHours(entry.blocks) : 0;
                         const source = entry?.source ?? 'CALC';
+                        // `source` locks the cell; `overrideBlocks` is the
+                        // only field that says how much of it the user typed.
+                        // The optimizer may top a pinned default-OPEX cell up
+                        // to a full day, so passing `hours` for both would
+                        // hand the field a figure the user never entered —
+                        // and Enter would then commit it over their pin.
+                        const overrideHours = entry ? blocksToHours(entry.overrideBlocks) : 0;
                         return (
                           <HourCell
                             key={date}
@@ -174,6 +181,7 @@ export function WeekTable({
                             otlProjectCode={code}
                             hours={hours}
                             source={source}
+                            overrideHours={overrideHours}
                             leaveSubtype={leaveLabel}
                             onOverride={(newHours) => onOverride(person.id, date, code, newHours)}
                             onRevert={() => onRevert(person.id, date, code)}
