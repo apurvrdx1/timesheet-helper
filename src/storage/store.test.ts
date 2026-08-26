@@ -496,6 +496,16 @@ describe('useStore: an unreadable verdict is retired by a read, not by comparing
     });
     expect(result.current.unreadableTabs).toEqual(['People']);
 
+    // The model must hold People of its own before the verdict can retire:
+    // a tab this session never loaded is EMPTY in memory, and writing that
+    // emptiness over the target's rows is the very thing the protection
+    // exists to stop (see 'a verdict is never retired for a tab the model is
+    // still empty for'). Retirement is about a tab the app can actually
+    // write something for.
+    act(() => {
+      result.current.update(addAPerson);
+    });
+
     readsAsAFreshTarget();
     await act(async () => {
       await result.current.connect({ backend: 'local', location: 'a-fresh-workbook' });
@@ -503,7 +513,10 @@ describe('useStore: an unreadable verdict is retired by a read, not by comparing
 
     const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
     act(() => {
-      result.current.update(addAPerson);
+      result.current.update((model) => ({
+        ...model,
+        people: [...model.people, { id: 'p3', name: 'Robin', role: 'REPORT', managerId: null }],
+      }));
     });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2000);
@@ -600,6 +613,13 @@ describe('useStore: an unreadable verdict is retired by a read, not by comparing
     await waitFor(() => expect(result.current.status).toBe('idle'));
     expect(result.current.unreadableTabs).toEqual(['People']);
     expect(result.current.dataNotice).not.toBeNull();
+
+    // As above: the verdict can only retire for a tab the model holds
+    // something for. Without this the app would still be holding the empty
+    // People list `parseTab` produced, and the next push would write it.
+    act(() => {
+      result.current.update(addAPerson);
+    });
 
     readsAsAFreshTarget();
     await act(async () => {
@@ -804,5 +824,195 @@ describe('useStore: a model with no allocated month is an empty state, not a sta
     await waitFor(() => expect(result.current.status).toBe('idle'));
 
     expect(result.current.needsAllocation).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N4 regression: `readVerdict` answers "is the target parseable?", but the
+// question `connect` must answer before overwriting a tab is "does the target
+// hold rows the in-memory model does not?". The two coincide only while
+// parseability is unchanged since the read that populated the model. They
+// diverge in exactly one direction — unparseable -> parseable — and that is
+// precisely the direction where the in-memory copy is EMPTY (`parseTab`
+// dropped the tab) and the target is FULL.
+//
+// The trigger is the app's own advice: "Restore the header row in your
+// spreadsheet, then reload this page." Restore it, then press Connect
+// instead of reloading.
+// ---------------------------------------------------------------------------
+
+describe('useStore: a verdict is never retired for a tab the model is still empty for', () => {
+  it('keeps the rows the user just repaired the header over, instead of writing a lone header row', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    // The tab was dropped whole, so the app holds NOTHING for People.
+    expect(result.current.model.people).toEqual([]);
+    expect(result.current.unreadableTabs).toEqual(['People']);
+
+    // The user does exactly what the notice asks — in the spreadsheet.
+    storeLocalPayload(schedulablePayload(PEOPLE_HEADER));
+
+    // ...and then presses Connect instead of reloading the page.
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: '' });
+    });
+
+    // What SURVIVED, not which keys were pushed: Alex is still there.
+    expect(readLocalPayload().People).toEqual([PEOPLE_HEADER, PEOPLE_ROW]);
+  });
+
+  it('tells the user the tab now reads correctly and a reload will load it', async () => {
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    storeLocalPayload(schedulablePayload(PEOPLE_HEADER));
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: '' });
+    });
+
+    expect(result.current.unreadableTabs).toEqual(['People']);
+    expect(result.current.dataNotice).toMatch(/now reads correctly/i);
+    expect(result.current.dataNotice).toMatch(/reload this page/i);
+    // And it must no longer claim the header is still broken.
+    expect(result.current.dataNotice).not.toMatch(/does not match the columns/i);
+  });
+
+  it('survives a transient empty read of the very tab that was unreadable', async () => {
+    // Reachable on Microsoft with NO user action: `readWorksheet` returns []
+    // on a 404, and `parseTab` reads a zero-row tab as "empty", not
+    // "unreadable" — a clean verdict with nothing in memory to replace it.
+    storeLocalPayload(schedulablePayload(BROKEN_PEOPLE_HEADER));
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    vi.spyOn(localOnlyAdapter, 'read').mockResolvedValueOnce({});
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: '' });
+    });
+
+    expect(readLocalPayload().People).toEqual([BROKEN_PEOPLE_HEADER, PEOPLE_ROW]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N4 regression: on a FIRST connect there is no standing verdict, so
+// `verdict?.unreadableTabs ?? unreadableTabsRef.current` degraded to `?? []`
+// and every tab was blind-written to a target the app could not read one row
+// of. A target we could not read is the one we know least about.
+// ---------------------------------------------------------------------------
+
+describe('useStore: a target that could not be read is not written to', () => {
+  it('leaves every tab of a first-ever target intact when the read fails', async () => {
+    // A fresh app: empty model, no verdict to fall back on.
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.unreadableTabs).toEqual([]);
+    expect(result.current.model).toEqual(emptyModel);
+
+    // The target the user points at already holds their data.
+    storeLocalPayload(schedulablePayload(PEOPLE_HEADER));
+
+    vi.spyOn(localOnlyAdapter, 'read').mockRejectedValue(new Error('consent required'));
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: 'their-real-workbook' });
+    });
+
+    // What SURVIVED: every tab, untouched.
+    const stored = readLocalPayload();
+    expect(stored.People).toEqual([PEOPLE_HEADER, PEOPLE_ROW]);
+    expect(stored.OTLs).toEqual(schedulablePayload(PEOPLE_HEADER).OTLs);
+    expect(stored.Allocations).toEqual(schedulablePayload(PEOPLE_HEADER).Allocations);
+  });
+
+  it('says the target could not be read instead of failing silently', async () => {
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    vi.spyOn(localOnlyAdapter, 'read').mockRejectedValue(new Error('consent required'));
+    await act(async () => {
+      await result.current.connect({ backend: 'local', location: 'their-real-workbook' });
+    });
+
+    expect(result.current.notice).toMatch(/could not be read/i);
+    expect(result.current.notice).toMatch(/consent required/i);
+    expect(result.current.notice).toMatch(/nothing was written/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N4 regression: `needsAllocation` is the right empty state for a model that
+// was NEVER scheduled. For one that WAS scheduled and then had its
+// allocations removed it over-suppresses: the backend still holds the
+// schedule rows and Meta still certifies the old hash, while the screen
+// recomputes from the current model — and nothing says so. Silent staleness.
+// ---------------------------------------------------------------------------
+
+describe('useStore: a certified schedule that lost its allocations is still reported', () => {
+  it('reports the certificate alongside needsAllocation once a schedule was calculated', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.update((model) => ({
+        ...withOverridesButNoAllocations(model),
+        allocations: [
+          { month: '2026-09', otlProjectCode: 'OPEX-ADMIN', personId: 'p1', hours: 40 },
+        ],
+      }));
+    });
+    act(() => {
+      result.current.recalculate();
+    });
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(result.current.isStale).toBe(false);
+    expect(result.current.result.entries.length).toBeGreaterThan(0);
+    expect(result.current.hasCertifiedSchedule).toBe(true);
+
+    // The allocations are removed afterwards.
+    act(() => {
+      result.current.update((model) => ({ ...model, allocations: [] }));
+    });
+
+    expect(result.current.isStale).toBe(true);
+    expect(result.current.needsAllocation).toBe(true);
+    // The discriminator: something WAS certified, so this is not the
+    // never-scheduled empty state.
+    expect(result.current.hasCertifiedSchedule).toBe(true);
+  });
+
+  it('reports no certificate for a model that has never been calculated', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.update(withOverridesButNoAllocations);
+    });
+
+    expect(result.current.needsAllocation).toBe(true);
+    expect(result.current.hasCertifiedSchedule).toBe(false);
+  });
+
+  it('reports no certificate when the cache only ever held the empty placeholder hash', async () => {
+    // `update` writes `hashRef.current ?? ''` — so an edit made before any
+    // recalculation leaves `''` in the cache. That is "never certified",
+    // not a hash.
+    saveCache(withOverridesButNoAllocations(emptyModel), '', { backend: 'local', location: '' });
+    vi.spyOn(localOnlyAdapter, 'read').mockRejectedValue(new Error('offline'));
+
+    const { result } = renderHook(() => useStore());
+    await waitFor(() => expect(result.current.status).toBe('offline'));
+
+    expect(result.current.needsAllocation).toBe(true);
+    expect(result.current.hasCertifiedSchedule).toBe(false);
   });
 });

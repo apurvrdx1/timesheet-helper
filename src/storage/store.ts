@@ -58,6 +58,23 @@ export interface StoreApi {
    * allocation instead of offering an action that cannot succeed.
    */
   needsAllocation: boolean;
+  /**
+   * True when a schedule HAS been calculated and certified — a model hash was
+   * recorded, and the backend's `Schedule`/`Meta` tabs hold what it certifies.
+   *
+   * This is what separates the two states `needsAllocation` used to conflate.
+   * A model that was NEVER scheduled and has nothing allocated is an empty
+   * state, and saying "out of date" about it is a nag. A model that WAS
+   * scheduled and then had its allocations removed is something else
+   * entirely: the stored schedule no longer matches the model, the screen
+   * recomputes from the current model, and the two disagree. Suppressing the
+   * banner there is silent staleness.
+   *
+   * `''` is not a certificate: `update` writes `hashRef.current ?? ''` to the
+   * cache, so an edit made before any recalculation leaves an empty string
+   * behind. `hashModel` never produces one.
+   */
+  hasCertifiedSchedule: boolean;
   update: (fn: (model: Model) => Model) => void;
   /**
    * Drops a push that `update` has queued on the debounce timer but not yet
@@ -82,6 +99,12 @@ const DEFAULT_CONFIG: BackendConfig = { backend: 'local', location: '' };
 
 const PUSH_DEBOUNCE_MS = 2000;
 
+/** Every tab a push can carry. Used as "protect all of it" for a target the
+ *  app could not read — see `connect`. */
+const ALL_TABS: readonly TabName[] = [
+  'OTLs', 'People', 'StatHolidays', 'Allocations', 'Leave', 'Overrides', 'Schedule', 'Meta',
+];
+
 /** Every month the model allocates into, deduplicated and sorted. */
 export function monthsOf(model: Model): IsoMonth[] {
   return [...new Set(model.allocations.map((a) => a.month))].sort();
@@ -99,6 +122,11 @@ interface ReadVerdict {
   unreadableTabs: readonly TabName[];
   problems: readonly string[];
 }
+
+/** A verdict about the target, or the reason there is none. */
+type ReadOutcome =
+  | { readonly kind: 'verdict'; readonly verdict: ReadVerdict }
+  | { readonly kind: 'unread'; readonly error: string };
 
 /**
  * Re-derives the unreadable-tab verdict by READING the target being moved to.
@@ -129,25 +157,32 @@ interface ReadVerdict {
  * never reads the model; replacing the in-memory model here would clobber
  * exactly the unsaved local edits that "write, never read" exists to keep.
  *
- * `null` means the target could not be read at all — which is not evidence
- * that it is clean, and callers must not treat it as such.
+ * A `kind: 'unread'` outcome means the target could not be read at all —
+ * which is not evidence that it is clean, and callers must not treat it as
+ * such. It carries the reason: a consent prompt, a blocked popup or a
+ * wrong sharing link used to vanish into a blanket `catch { return null }`
+ * while the app went on telling the user to fix a header in the spreadsheet
+ * they had just left. The trade is safe; the silence was not.
  */
-async function readVerdict(config: BackendConfig): Promise<ReadVerdict | null> {
+async function readVerdict(config: BackendConfig): Promise<ReadOutcome> {
   try {
     const payload = await getAdapter(config.backend).read(config);
     const model_ = rowsToModel(payload);
     const schedule_ = rowsToScheduleEntries(payload);
     const meta_ = rowsToMeta(payload);
     return {
-      unreadableTabs: [
-        ...model_.unreadableTabs,
-        ...schedule_.unreadableTabs,
-        ...meta_.unreadableTabs,
-      ],
-      problems: [...model_.problems, ...schedule_.problems, ...meta_.problems],
+      kind: 'verdict',
+      verdict: {
+        unreadableTabs: [
+          ...model_.unreadableTabs,
+          ...schedule_.unreadableTabs,
+          ...meta_.unreadableTabs,
+        ],
+        problems: [...model_.problems, ...schedule_.problems, ...meta_.problems],
+      },
     };
-  } catch {
-    return null;
+  } catch (error) {
+    return { kind: 'unread', error: messageOf(error) };
   }
 }
 
@@ -270,6 +305,87 @@ function dataNoticeFor(
   return null;
 }
 
+/**
+ * True when the in-memory model holds NOTHING for `tab`.
+ *
+ * This is the discriminator `connect` was missing. `readVerdict` answers
+ * "is the target parseable?"; the question that must be answered before a
+ * push overwrites a tab is "does the target hold rows the model does not?".
+ * The two coincide only while parseability is unchanged since the read that
+ * populated the model, and they diverge in exactly one direction —
+ * unparseable becoming parseable — which is precisely the direction where
+ * `parseTab` dropped the tab, so the in-memory copy is EMPTY and the
+ * target's copy is FULL.
+ */
+function isEmptyInMemory(
+  tab: TabName,
+  model: Model,
+  entries: ScheduleResult['entries'],
+  hash: string | null,
+): boolean {
+  switch (tab) {
+    case 'OTLs': return model.otls.length === 0;
+    case 'People': return model.people.length === 0;
+    case 'StatHolidays': return model.statHolidays.length === 0;
+    case 'Allocations': return model.allocations.length === 0;
+    case 'Leave': return model.leave.length === 0;
+    case 'Overrides': return model.overrides.length === 0;
+    case 'Schedule': return entries.length === 0;
+    case 'Meta': return hash === null || hash === '';
+  }
+}
+
+/**
+ * The tabs a standing verdict protects that the fresh read now parses
+ * cleanly, but which the model is STILL empty for — because this session
+ * never loaded them.
+ *
+ * Retiring their protection is what let `connect` write a lone header row
+ * over rows the user had just repaired the header on: the app tells them
+ * "restore the header row, then reload this page", and pressing Connect
+ * instead produced a clean verdict against an empty model. Keeping them
+ * protected is strictly more conservative than writing them, and it matches
+ * the advice the app already gives.
+ */
+function stillEmptyTabs(
+  standing: readonly TabName[],
+  verdict: ReadVerdict,
+  model: Model,
+  entries: ScheduleResult['entries'],
+  hash: string | null,
+): TabName[] {
+  return standing.filter(
+    (tab) => !verdict.unreadableTabs.includes(tab) && isEmptyInMemory(tab, model, entries, hash),
+  );
+}
+
+/**
+ * The notice for a tab that now reads correctly but which this session never
+ * loaded. Repeating "the header row does not match" would be false — the
+ * user has already fixed that. The honest statement is that the app is
+ * holding nothing for the tab, is still not writing over it, and a reload is
+ * what picks it up.
+ */
+function recoveredNoticeFor(tabs: readonly TabName[]): string | null {
+  if (tabs.length === 0) return null;
+  const isPlural = tabs.length > 1;
+  const subject = `${listTabs(tabs)} ${isPlural ? 'tabs' : 'tab'}`;
+  const pronoun = isPlural ? 'them' : 'it';
+  return (
+    `The ${subject} now ${isPlural ? 'read' : 'reads'} correctly, but this session never loaded ` +
+    `${isPlural ? 'their' : 'its'} contents, so the app is still holding nothing for ${pronoun} — ` +
+    `and is still not writing over ${pronoun}. Reload this page to load ${pronoun}.`
+  );
+}
+
+/** What to say when a target could not be read and so was not written to. */
+function unreadTargetNotice(error: string): string {
+  return (
+    `Connected, but the target could not be read (${error}), so nothing was written to it — ` +
+    'every tab is left exactly as it is. Reload this page once the target is reachable.'
+  );
+}
+
 export function useStore(): StoreApi {
   const initialCache = useRef(loadCache()).current;
 
@@ -314,15 +430,21 @@ export function useStore(): StoreApi {
    * replaced; only a tab that could not be read at all still has something
    * to say.
    */
-  const adoptVerdict = useCallback((verdict: ReadVerdict): void => {
-    unreadableTabsRef.current = verdict.unreadableTabs;
-    setUnreadableTabs(verdict.unreadableTabs);
-    setDataNotice(
-      verdict.unreadableTabs.length > 0
-        ? dataNoticeFor(verdict.unreadableTabs, verdict.problems)
-        : null,
-    );
-  }, []);
+  const adoptVerdict = useCallback(
+    (verdict: ReadVerdict, stillEmpty: readonly TabName[]): void => {
+      const kept = [...new Set([...verdict.unreadableTabs, ...stillEmpty])];
+      unreadableTabsRef.current = kept;
+      setUnreadableTabs(kept);
+      const messages = [
+        verdict.unreadableTabs.length > 0
+          ? dataNoticeFor(verdict.unreadableTabs, verdict.problems)
+          : null,
+        recoveredNoticeFor(stillEmpty),
+      ].filter((text): text is string => text !== null);
+      setDataNotice(messages.length === 0 ? null : messages.join(' '));
+    },
+    [],
+  );
 
   const pushToAdapter = useCallback(
     async (pushModel: Model, entries: ScheduleResult['entries'], hash: string | null) => {
@@ -515,11 +637,8 @@ export function useStore(): StoreApi {
       // and its payload is used for nothing but the verdict.
       //
       // A read that fails says nothing about the target — least of all that
-      // it is clean. The standing verdict is kept in that case: at worst a
-      // tab is not written, which is recoverable; assuming a target we could
-      // not read is clean is what is not.
-      const verdict = await readVerdict(newConfig);
-      const protectedTabs = verdict?.unreadableTabs ?? unreadableTabsRef.current;
+      // it is clean.
+      const outcome = await readVerdict(newConfig);
 
       // Switching backends must not lose data: write the in-memory model to
       // the newly selected backend rather than reading it and possibly
@@ -527,6 +646,30 @@ export function useStore(): StoreApi {
       const currentModel = modelRef.current;
       const hash = hashRef.current ?? hashModel(currentModel);
       const entries = resultRef.current.entries;
+
+      // A clean verdict is NOT permission to write a tab this session never
+      // loaded. `parseTab` drops an unreadable tab whole, so the model holds
+      // nothing for it while the target holds everything — and the app's own
+      // remediation ("restore the header row, then reload this page")
+      // reaches exactly that state when the user presses Connect instead of
+      // reloading. Such a tab keeps its protection until a read populates
+      // the model with it.
+      const stillEmpty =
+        outcome.kind === 'verdict'
+          ? stillEmptyTabs(
+              unreadableTabsRef.current, outcome.verdict, currentModel, entries, hashRef.current,
+            )
+          : [];
+
+      // A target we could not read is the one we know least about, so
+      // protect ALL of it. Falling back to the standing verdict looks
+      // equivalent but is not: on a FIRST connect there is no standing
+      // verdict, so `?? unreadableTabsRef.current` degraded to `?? []` and
+      // every tab was blind-written to a target the app could not read one
+      // row of. At worst nothing is written, which is recoverable.
+      const protectedTabs: readonly TabName[] =
+        outcome.kind === 'verdict' ? [...outcome.verdict.unreadableTabs, ...stillEmpty] : ALL_TABS;
+
       await adapter.write(
         newConfig,
         buildSheetPayload(
@@ -539,9 +682,13 @@ export function useStore(): StoreApi {
 
       setConfig(newConfig);
       saveCache(currentModel, hash, newConfig);
-      if (verdict !== null) adoptVerdict(verdict);
+      if (outcome.kind === 'verdict') adoptVerdict(outcome.verdict, stillEmpty);
       setStatus('idle');
-      setNotice(null);
+      // A failed read used to disappear into a blanket catch. Consent
+      // required, a blocked popup and a wrong sharing link all land here,
+      // and the user needs to know that nothing was written — otherwise the
+      // app looks connected and saved when it is neither.
+      setNotice(outcome.kind === 'unread' ? unreadTargetNotice(outcome.error) : null);
     } catch (error) {
       setStatus('error');
       setNotice(`Could not connect: ${messageOf(error)}.`);
@@ -565,8 +712,19 @@ export function useStore(): StoreApi {
       // (including one the backend switcher carried over from a previous
       // backend) read as "a different store" and dropped the protection,
       // while the local-only adapter has exactly one store regardless.
-      const verdict = await readVerdict(fallback);
-      if (verdict !== null) adoptVerdict(verdict);
+      const outcome = await readVerdict(fallback);
+      if (outcome.kind === 'verdict') {
+        // Same rule as `connect`: a tab this session never loaded is empty
+        // in memory, so a clean read of the store being landed on must not
+        // free the next debounced push to write that emptiness over it.
+        adoptVerdict(
+          outcome.verdict,
+          stillEmptyTabs(
+            unreadableTabsRef.current, outcome.verdict, modelRef.current,
+            resultRef.current.entries, hashRef.current,
+          ),
+        );
+      }
       setStatus('idle');
     }
   }, [adoptVerdict]);
@@ -577,6 +735,8 @@ export function useStore(): StoreApi {
     config,
     isStale: hashModel(model) !== lastCalculatedHash,
     needsAllocation: hasNoAllocatedMonths(model),
+    hasCertifiedSchedule:
+      (lastCalculatedHash !== null && lastCalculatedHash !== '') || result.entries.length > 0,
     status,
     notice,
     dataNotice,
