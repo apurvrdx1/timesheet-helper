@@ -20,7 +20,8 @@ import { Button } from '@astryxdesign/core/Button';
 import { AlertDialog } from '@astryxdesign/core/AlertDialog';
 import { WeekTable } from './WeekTable';
 import { formatWeekRange, weekDays, monthOf } from '../../domain/calendar';
-import { BLOCKS_PER_DAY, HOURS_PER_BLOCK } from '../../domain/types';
+import { leaveDatesFor, weekCapacity } from '../../domain/capacity';
+import { HOURS_PER_BLOCK } from '../../domain/types';
 import type {
   IsoDate, IsoMonth, Model, OtlCode, PersonId, ScheduleResult,
 } from '../../domain/types';
@@ -79,12 +80,19 @@ const STATUS_WORD: Record<StatusDotVariant, string> = {
   accent: '', neutral: '',
 };
 
+/**
+ * The hours this week can actually hold, summed over everyone the panel
+ * shows. Capacity is per person and leave is per person, so the domain's own
+ * `leaveDatesFor`/`weekCapacity` decide it — the same pair `scheduleWeek`
+ * and `AllocationGrid` already use. Counting stat holidays by hand (which is
+ * all this did) advertised 37.5h for a week somebody spent three days of it
+ * on vacation, while the optimizer was working to 30.0h.
+ */
 function weekCapacityHours(weekDates: IsoDate[], model: Model): number {
-  const statHolidayDates = new Set(
-    model.statHolidays.filter((holiday) => weekDates.includes(holiday.date)).map((holiday) => holiday.date),
-  );
-  const workingDays = weekDates.length - statHolidayDates.size;
-  return workingDays * BLOCKS_PER_DAY * HOURS_PER_BLOCK;
+  return model.people.reduce((hours, person) => {
+    const leaveDates = leaveDatesFor(person.id, weekDates, model);
+    return hours + weekCapacity(leaveDates, weekDates) * HOURS_PER_BLOCK;
+  }, 0);
 }
 
 export function WeekAccordion({
