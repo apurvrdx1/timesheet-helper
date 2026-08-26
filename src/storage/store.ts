@@ -110,6 +110,14 @@ function impliesSchedule(model: Model): boolean {
  * a model that clearly has one. Both cloud writers clear a tab before
  * writing it, so "write nothing there" is the only way to keep the user's
  * data.
+ *
+ * `Meta` is bound to `Schedule` and always travels with it. Meta carries
+ * exactly one thing: the hash of the model the Schedule tab was calculated
+ * against. It is a CERTIFICATE FOR the Schedule tab, and publishing the
+ * certificate without the thing it certifies is how a sheet ends up
+ * declaring a schedule current that was never written — after which no
+ * future load ever prompts a recalculation, because the hash says there is
+ * nothing to do.
  */
 function tabsToProtect(
   model: Model,
@@ -118,6 +126,7 @@ function tabsToProtect(
 ): TabName[] {
   const omitted = new Set<TabName>(unreadableTabs);
   if (entries.length === 0 && impliesSchedule(model)) omitted.add('Schedule');
+  if (omitted.has('Schedule')) omitted.add('Meta');
   return [...omitted];
 }
 
@@ -370,6 +379,22 @@ export function useStore(): StoreApi {
       setNotice(`Could not recalculate: ${messageOf(error)}.`);
       return;
     }
+
+    // A recalculation that placed nothing for a model that plainly has a
+    // schedule did not succeed — it ran over an empty window of months and
+    // computed over zero weeks. Recording its hash would clear the stale
+    // banner and certify a Schedule tab nobody wrote. Report it the same
+    // non-blocking way a scheduling failure is reported, and leave the
+    // model exactly as it was: still stale, still recoverable.
+    if (newResult.entries.length === 0 && impliesSchedule(currentModel)) {
+      setNotice(
+        'Could not recalculate: nothing could be scheduled, because the model has no ' +
+        'allocated months to place hours into. Add an allocation on the Allocations tab ' +
+        'for the month you are planning, then recalculate.',
+      );
+      return;
+    }
+
     const hash = hashModel(currentModel);
 
     setResult(newResult);

@@ -501,3 +501,108 @@ describe('useStore: an unreadable verdict does not follow the user to another ba
     expect(result.current.dataNotice).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// N3 regression: `tabsToProtect` omitted `Schedule` when there was no result
+// to write, but never `Meta` — so a push could leave the Schedule tab
+// untouched while Meta's hash certified it as current. No later load would
+// ever prompt a recalculation again.
+// ---------------------------------------------------------------------------
+
+/** People and overrides, but no allocations: `monthsOf` is empty, so
+ *  `recalculate` schedules over zero weeks and produces no entries — while
+ *  the Weeks page, whose window is `monthsOf(model) ∪ {month}`, shows a full
+ *  schedule for the month on screen. */
+const withOverridesButNoAllocations = (model: Model): Model => ({
+  ...model,
+  otls: [{
+    projectCode: 'OPEX-ADMIN', taskCode: 'T0', expenditureTypeCode: 'E0',
+    timeReportingCode: 'R0', category: 'OPEX', leaveSubtype: null,
+    isDefaultOpex: true, colorIndex: 1, active: true,
+  }],
+  people: [{ id: 'p1', name: 'Alex', role: 'MANAGER', managerId: null }],
+  overrides: [{ personId: 'p1', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 7.5 }],
+});
+
+describe('useStore: Meta never certifies a Schedule that was not written', () => {
+  it('omits Meta from every push that omits Schedule', async () => {
+    storeLocalPayload(schedulablePayload(PEOPLE_HEADER));
+    vi.useFakeTimers();
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(result.current.result.entries).toEqual([]);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'Schedule' in pushed).toBe(false);
+    expect(pushed && 'Meta' in pushed).toBe(false);
+    expect(pushed && 'People' in pushed).toBe(true);
+  });
+
+  it('does not certify anything when a recalculation places nothing', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.update(withOverridesButNoAllocations);
+    });
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+
+    act(() => {
+      result.current.recalculate();
+    });
+
+    // The stale banner must stay up and the user must be told why, rather
+    // than the app quietly declaring itself current.
+    expect(result.current.isStale).toBe(true);
+    expect(result.current.notice).toMatch(/could not recalculate/i);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    // And nothing certifying a schedule reached the backend.
+    for (const call of writeSpy.mock.calls) {
+      const pushed = call[1];
+      expect(pushed && 'Meta' in pushed).toBe(false);
+      expect(pushed && 'Schedule' in pushed).toBe(false);
+    }
+    expect('Meta' in readLocalPayload()).toBe(false);
+  });
+
+  it('still writes Schedule and Meta together when there is a real result', async () => {
+    storeLocalPayload(schedulablePayload(PEOPLE_HEADER));
+    vi.useFakeTimers();
+    const writeSpy = vi.spyOn(localOnlyAdapter, 'write');
+
+    const { result } = renderHook(() => useStore());
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    act(() => {
+      result.current.recalculate();
+    });
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+
+    expect(result.current.result.entries.length).toBeGreaterThan(0);
+    const pushed = writeSpy.mock.calls[0]?.[1];
+    expect(pushed && 'Schedule' in pushed).toBe(true);
+    expect(pushed && 'Meta' in pushed).toBe(true);
+  });
+});
