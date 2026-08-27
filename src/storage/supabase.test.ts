@@ -17,7 +17,8 @@
  */
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { describe, expect, it } from 'vitest';
-import { createSupabaseAdapter, toStatePayload, WRITE_RPC } from './supabase';
+import { APPROVED_RPC, createSupabaseAdapter, toStatePayload, WRITE_RPC } from './supabase';
+import { INSUFFICIENT_PRIVILEGE, StorageError } from './modelAdapter';
 import type { StoredState } from './modelAdapter';
 import type { Model } from '../domain/types';
 
@@ -28,10 +29,20 @@ import type { Model } from '../domain/types';
 type Row = Record<string, unknown>;
 type Tables = Readonly<Record<string, readonly Row[]>>;
 
+interface OrderStep {
+  readonly column: string;
+  readonly nullsFirst?: boolean;
+}
+
 interface SelectCall {
   readonly table: string;
   readonly columns: string;
-  readonly order: readonly string[];
+  /** The full option object of every `.order()`, not just the column name. */
+  readonly order: readonly OrderStep[];
+  /** What `.select()` was asked to count, e.g. `'exact'`. */
+  readonly count: string | undefined;
+  /** Every `[from, to]` this builder was asked for. One per page. */
+  readonly ranges: readonly (readonly [number, number])[];
 }
 interface RpcCall {
   readonly fn: string;
@@ -49,14 +60,43 @@ interface Failures {
   readonly selectTable?: string;
   /** Message the rpc should come back as an error with. */
   readonly rpc?: string;
+  /** SQLSTATE the failing rpc reports. Defaults to 42501. */
+  readonly rpcCode?: string;
+  /** `is_approved()` answers false — a revoked or never-approved account. */
+  readonly notApproved?: boolean;
+  /**
+   * The server's `db-max-rows` ceiling. PostgREST truncates a select to this
+   * many rows and reports 200, not an error — the whole reason `selectOrdered`
+   * paginates. `Infinity` (the default) is "no ceiling".
+   */
+  readonly maxRows?: number;
+  /**
+   * Row count the server reports, when it should disagree with the rows it
+   * actually hands over. Models a read that can never be completed.
+   */
+  readonly countSays?: number;
 }
 
 /**
  * An in-memory stand-in for the two client surfaces the adapter uses:
- * `from(table).select(columns).order(...)` and `rpc(fn, args)`. It records
- * every call, which is how the tests assert on things that have no visible
- * result — that `'*'` is never selected, that `person_key` is never written,
- * and that the write is exactly one request.
+ * `from(table).select(columns, opts).order(...).range(...)` and `rpc(fn, args)`.
+ *
+ * ## It PROJECTS, and that is the point
+ *
+ * The first version of this fake recorded the requested column list and then
+ * returned the whole fixture row regardless. Every column-list constant in
+ * `supabase.ts` was therefore an untested string: dropping `person_id` from
+ * `ALLOCATION_COLUMNS` — the one field this entire layer is organised around —
+ * left the suite 448/448 green and `tsc` clean. So `select(columns)` here
+ * returns rows containing EXACTLY the requested keys, the way PostgREST does.
+ * A column list that forgets a field now produces rows without that field, and
+ * the mapping tests go red.
+ *
+ * It also keeps `.order()`'s whole option object rather than the column name
+ * alone, so `nullsFirst` is load-bearing; models `db-max-rows` truncation and
+ * the exact count that detects it; and gives errors the shape PostgREST really
+ * sends (`code`, `details`, `hint`, not `message` alone), so the code that
+ * branches on `code` is exercised rather than merely written.
  *
  * Cast to `SupabaseClient` at the boundary: the real client's type is built
  * from generated database types this project does not have, so it cannot be
@@ -66,33 +106,84 @@ interface Failures {
 function fakeClient(tables: Tables, failures: Failures = {}): Fake {
   const selects: SelectCall[] = [];
   const rpcs: RpcCall[] = [];
+  const maxRows = failures.maxRows ?? Number.POSITIVE_INFINITY;
 
   const client = {
     from(table: string) {
-      const order: string[] = [];
-      const call: SelectCall = { table, columns: '', order };
+      const order: OrderStep[] = [];
+      const ranges: (readonly [number, number])[] = [];
+      let projection: readonly string[] | null = null;
+      let exactCount = false;
+
       const builder = {
-        select(columns: string) {
-          selects.push({ ...call, columns, order });
+        select(columns: string, options?: { readonly count?: string }) {
+          exactCount = options?.count === 'exact';
+          projection = columns.trim() === '*' ? null : columns.split(',').map((c) => c.trim());
+          selects.push({ table, columns, order, count: options?.count, ranges });
           return builder;
         },
-        order(column: string) {
-          order.push(column);
+        order(column: string, options?: { readonly nullsFirst?: boolean }) {
+          order.push(options === undefined ? { column } : { column, ...options });
           return builder;
         },
-        then<T>(onFulfilled: (value: { data: readonly Row[] | null; error: { message: string } | null }) => T) {
-          const result = failures.selectTable === table
-            ? { data: null, error: { message: `relation "${table}" is on fire` } }
-            : { data: tables[table] ?? [], error: null };
-          return Promise.resolve(result).then(onFulfilled);
+        range(from: number, to: number) {
+          ranges.push([from, to]);
+          return builder;
+        },
+        then<T>(
+          onFulfilled: (value: {
+            data: readonly Row[] | null;
+            error: { message: string; code: string; details: string | null; hint: string | null } | null;
+            count: number | null;
+          }) => T,
+        ) {
+          if (failures.selectTable === table) {
+            return Promise.resolve({
+              data: null,
+              // The shape PostgREST actually sends. `code` is what the adapter
+              // has to carry through for a caller to tell 42501 from 42P01.
+              error: {
+                message: `relation "${table}" is on fire`,
+                code: '42P01',
+                details: 'it is really quite on fire',
+                hint: null,
+              },
+              count: null,
+            }).then(onFulfilled);
+          }
+          const all = tables[table] ?? [];
+          const wanted = projection;
+          const projected = wanted === null
+            ? all
+            : all.map((row) => Object.fromEntries(wanted.map((column) => [column, row[column]])));
+          const [from, to] = ranges[ranges.length - 1] ?? [0, Number.POSITIVE_INFINITY];
+          const page = projected.slice(from, to + 1).slice(0, maxRows);
+          return Promise.resolve({
+            data: page,
+            error: null,
+            count: exactCount ? (failures.countSays ?? all.length) : null,
+          }).then(onFulfilled);
         },
       };
       return builder;
     },
-    rpc(fn: string, args: Record<string, unknown>) {
-      rpcs.push({ fn, args });
+    rpc(fn: string, args?: Record<string, unknown>) {
+      rpcs.push({ fn, args: args ?? {} });
+      if (fn === APPROVED_RPC) {
+        return Promise.resolve({ data: failures.notApproved !== true, error: null });
+      }
       return Promise.resolve(
-        failures.rpc === undefined ? { data: null, error: null } : { data: null, error: { message: failures.rpc } },
+        failures.rpc === undefined
+          ? { data: null, error: null }
+          : {
+            data: null,
+            error: {
+              message: failures.rpc,
+              code: failures.rpcCode ?? '42501',
+              details: null,
+              hint: null,
+            },
+          },
       );
     },
   };
@@ -363,18 +454,137 @@ describe('createSupabaseAdapter().read', () => {
     // reloads read as data loss even when nothing changed.
     const fake = fakeClient(FULL_TABLES);
     await createSupabaseAdapter(fake.client).read();
+    //
+    // Asserted as the whole option object, not the column name. `nullsFirst`
+    // decides where the OTL's monthly TOTAL (the null-personId allocation)
+    // sorts relative to the rows it totals, and ascending and descending
+    // disagree on the default — so dropping it is a real behaviour change that
+    // an assertion on column names alone cannot see.
     const ordering = Object.fromEntries(fake.selects.map((s) => [s.table, s.order]));
-    expect(ordering['otls']).toEqual(['project_code']);
-    expect(ordering['allocations']).toEqual(['month', 'otl_project_code', 'person_id']);
-    expect(ordering['leave_ranges']).toEqual(['person_id', 'start_date', 'end_date', 'otl_project_code']);
-    expect(ordering['schedule']).toEqual(['person_id', 'date', 'otl_project_code']);
+    expect(ordering['otls']).toEqual([{ column: 'project_code' }]);
+    expect(ordering['allocations']).toEqual([
+      { column: 'month' },
+      { column: 'otl_project_code' },
+      { column: 'person_id', nullsFirst: true },
+    ]);
+    expect(ordering['leave_ranges']).toEqual([
+      { column: 'person_id' },
+      { column: 'start_date' },
+      { column: 'end_date' },
+      { column: 'otl_project_code' },
+    ]);
+    expect(ordering['schedule']).toEqual([
+      { column: 'person_id' },
+      { column: 'date' },
+      { column: 'otl_project_code' },
+    ]);
   });
 
-  it('throws naming the table when a read fails', async () => {
+  it('throws naming the table when a read fails, and carries the Postgres code', async () => {
     const fake = fakeClient(FULL_TABLES, { selectTable: 'allocations' });
-    await expect(createSupabaseAdapter(fake.client).read()).rejects.toThrow(
+    const failure = await createSupabaseAdapter(fake.client).read().catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(StorageError);
+    expect((failure as StorageError).message).toMatch(
       /could not read allocations from Supabase: relation "allocations" is on fire/,
     );
+    // The code, not just the prose. Without it no caller can tell a broken
+    // database from a refused one except by matching on English.
+    expect((failure as StorageError).code).toBe('42P01');
+    expect((failure as StorageError).details).toBe('it is really quite on fire');
+  });
+
+  // -------------------------------------------------------------------------
+  // A denied read is not an empty one
+  // -------------------------------------------------------------------------
+
+  it('refuses to hand back a state for an account that is not approved', async () => {
+    // The data-loss path this exists to close: RLS answers a revoked account's
+    // select with zero rows and no error, so without this the adapter would
+    // return EMPTY_STATE, the app would show a blank grid, and the next
+    // debounced write would make the blank grid the account's real state.
+    //
+    // Note the fixture: the tables are FULL. The rows exist; it is the reader
+    // who is not allowed to see them. Returning an empty state here would be
+    // wrong even though every select "succeeded".
+    const fake = fakeClient(FULL_TABLES, { notApproved: true });
+    const failure = await createSupabaseAdapter(fake.client).read().catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(StorageError);
+    expect((failure as StorageError).code).toBe(INSUFFICIENT_PRIVILEGE);
+  });
+
+  it('decides approval from profiles, not from the read coming back empty', async () => {
+    // The rule, stated as a test: the same empty tables produce an empty state
+    // when `is_approved()` says yes and an error when it says no. Nothing in
+    // the ROWS distinguishes the two cases — only `profiles` does.
+    const approvedEmpty = await createSupabaseAdapter(fakeClient({}).client).read();
+    expect(approvedEmpty).toEqual(EMPTY_STATE);
+
+    await expect(
+      createSupabaseAdapter(fakeClient({}, { notApproved: true }).client).read(),
+    ).rejects.toThrow(/not approved/);
+
+    // And it asks the database, rather than inferring it.
+    const fake = fakeClient({});
+    await createSupabaseAdapter(fake.client).read();
+    expect(fake.rpcs.map((r) => r.fn)).toContain(APPROVED_RPC);
+  });
+
+  // -------------------------------------------------------------------------
+  // A truncated read is not a short state
+  // -------------------------------------------------------------------------
+
+  it('pages past the server row ceiling instead of returning a prefix', async () => {
+    // PostgREST caps an unbounded select at `db-max-rows` and answers 200 with
+    // a partial Content-Range — no error anywhere. Combined with a write that
+    // replaces the whole account, a prefix read is a delete of everything
+    // after it. The ceiling here is 3 against 7 rows, so a single-request read
+    // would return 3 and lose 4.
+    const many = Array.from({ length: 7 }, (_, i) => ({
+      person_id: 'rep',
+      date: `2026-01-0${i + 1}`,
+      otl_project_code: 'CAP-1',
+      blocks: 15,
+      source: 'CALC',
+      override_blocks: 0,
+    }));
+    const fake = fakeClient({ ...FULL_TABLES, schedule: many }, { maxRows: 3 });
+    const state = await createSupabaseAdapter(fake.client).read();
+    expect(state.entries).toHaveLength(7);
+    expect(state.entries.map((e) => e.date)).toEqual(many.map((r) => r.date));
+
+    // And it did it by asking for successive ranges, not by asking once.
+    const scheduleRanges = fake.selects.filter((s) => s.table === 'schedule').flatMap((s) => s.ranges);
+    expect(scheduleRanges.length).toBeGreaterThan(1);
+    expect(scheduleRanges[0]?.[0]).toBe(0);
+    expect(fake.selects.every((s) => s.count === 'exact')).toBe(true);
+  });
+
+  it('throws rather than return a short state when the server stops short', async () => {
+    // The count says 99; the server will only ever hand over 2. That is a read
+    // that cannot be completed, and the one thing it must not do is quietly
+    // become the state the next write commits.
+    const fake = fakeClient(FULL_TABLES, { countSays: 99 });
+    await expect(createSupabaseAdapter(fake.client).read()).rejects.toThrow(
+      /stopped returning rows at 2 of 99/,
+    );
+  });
+
+  it('throws when the server returns no row count at all', async () => {
+    // Without a count there is no way to know a page is the whole table.
+    const noCount = {
+      from() {
+        const builder = {
+          select: () => builder,
+          order: () => builder,
+          range: () => builder,
+          then: <T,>(f: (v: { data: never[]; error: null; count: null }) => T) =>
+            Promise.resolve({ data: [], error: null, count: null }).then(f),
+        };
+        return builder;
+      },
+      rpc: () => Promise.resolve({ data: true, error: null }),
+    } as unknown as SupabaseClient;
+    await expect(createSupabaseAdapter(noCount).read()).rejects.toThrow(/no row count/);
   });
 });
 
@@ -468,11 +678,19 @@ describe('createSupabaseAdapter().write', () => {
     });
   });
 
-  it('throws when the write fails', async () => {
+  it('throws when the write fails, carrying the Postgres code', async () => {
     const fake = fakeClient({}, { rpc: 'new row violates row-level security policy for table "otls"' });
-    await expect(createSupabaseAdapter(fake.client).write(FULL_STATE)).rejects.toThrow(
+    const failure = await createSupabaseAdapter(fake.client)
+      .write(FULL_STATE)
+      .catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(StorageError);
+    expect((failure as StorageError).message).toMatch(
       /could not write state to Supabase: new row violates row-level security policy/,
     );
+    // A revoked admin hits exactly this. The app has to route it to the
+    // pending/revoked screen, and it must not have to do that by reading the
+    // sentence — which is why the code is carried and not flattened away.
+    expect((failure as StorageError).code).toBe(INSUFFICIENT_PRIVILEGE);
   });
 });
 

@@ -63,6 +63,7 @@ import type {
   ScheduleEntry,
   StatHoliday,
 } from '../domain/types';
+import { INSUFFICIENT_PRIVILEGE, StorageError } from './modelAdapter';
 import type { StorageAdapter, StoredState } from './modelAdapter';
 
 // ---------------------------------------------------------------------------
@@ -161,19 +162,74 @@ const META_COLUMNS = 'model_hash';
 /** The RPC that performs the whole write. See `0005_widen_keys.sql`. */
 export const WRITE_RPC = 'replace_state';
 
+/**
+ * The RPC that answers "is the caller approved?".
+ *
+ * `is_approved()` (`0003_rls.sql`) is the same `security definer` function
+ * every row-level-security policy calls, so it cannot disagree with what the
+ * policies will do — it reads `profiles.approved` for `auth.uid()` and
+ * coalesces a missing profile to false. `read` below calls it because a
+ * `using` refusal is SILENT: RLS hides rows, it does not raise, so a revoked
+ * account's select is indistinguishable from a brand-new account's.
+ */
+export const APPROVED_RPC = 'is_approved';
+
 // ---------------------------------------------------------------------------
 // Reading
 // ---------------------------------------------------------------------------
 
 /**
- * One ordered `select`. The order columns are each table's natural key, so a
- * reload presents rows in the same sequence every time — PostgREST makes no
- * ordering promise otherwise, and a UI whose rows shuffle between reloads
- * looks like data loss even when nothing changed.
+ * How many rows one page of a read asks for.
+ *
+ * Not a limit: `selectOrdered` below keeps asking until it has the whole table
+ * (see there for why a partial read is a data-loss bug and not a performance
+ * one). The number only trades round trips against payload size.
+ */
+const PAGE_SIZE = 1000;
+
+/**
+ * One ordered `select`, read to completion.
+ *
+ * The order columns are each table's natural key, so a reload presents rows in
+ * the same sequence every time — PostgREST makes no ordering promise
+ * otherwise, and a UI whose rows shuffle between reloads looks like data loss
+ * even when nothing changed.
  *
  * `nullsFirst` is stated explicitly wherever a sort column is nullable: the
  * default differs between ascending and descending, and "whichever Postgres
  * felt like" is not an order.
+ *
+ * ## Why this paginates, and why it counts
+ *
+ * An unbounded PostgREST select is NOT "every row". Every project carries a
+ * `db-max-rows` ceiling (Settings → API → "Max rows"); over it PostgREST
+ * returns **200 with a partial `Content-Range`**, and supabase-js reports no
+ * error at all. `schedule` holds one row per person per day per OTL, so a real
+ * account is thousands of rows and is over any plausible ceiling.
+ *
+ * That would be survivable if reads were all this layer did. They are not:
+ * `write` is an unconditional whole-account replace, so a silently truncated
+ * read followed by the next debounced write DELETES the remainder — atomically
+ * and irreversibly. A short read is therefore a data-loss bug, not a
+ * performance one.
+ *
+ * The loop below is deliberately independent of what the ceiling actually is,
+ * because this project's value could not be measured from here (it needs an
+ * approved account, and no service-role key was available) and could be changed
+ * in the dashboard tomorrow. It asks the server for the exact row count and
+ * keeps requesting ranges until it holds that many:
+ *
+ *   * a page shorter than asked for is fine — that is the ceiling doing its
+ *     job — as long as the loop comes back for the rest;
+ *   * a page of zero rows while rows are still outstanding is a hard stop, so
+ *     a ceiling of 0 (or a server that stops paginating) fails loudly instead
+ *     of silently returning a prefix;
+ *   * a count that changes mid-read means someone else wrote to this account
+ *     between pages, so the pages no longer describe one state — a torn read,
+ *     which is refused rather than assembled.
+ *
+ * The cost is an exact count per table per read. That is the price of the
+ * guarantee, and it is paid once per load.
  */
 async function selectOrdered<Row>(
   client: SupabaseClient,
@@ -181,21 +237,57 @@ async function selectOrdered<Row>(
   columns: string,
   order: readonly { readonly column: string; readonly nullsFirst?: boolean }[],
 ): Promise<readonly Row[]> {
-  let query = client.from(table).select(columns);
-  for (const step of order) {
-    query = step.nullsFirst === undefined
-      ? query.order(step.column)
-      : query.order(step.column, { nullsFirst: step.nullsFirst });
+  const rows: Row[] = [];
+  let expected: number | null = null;
+
+  for (;;) {
+    let query = client.from(table).select(columns, { count: 'exact' });
+    for (const step of order) {
+      query = step.nullsFirst === undefined
+        ? query.order(step.column)
+        : query.order(step.column, { nullsFirst: step.nullsFirst });
+    }
+    const { data, error, count } = await query.range(rows.length, rows.length + PAGE_SIZE - 1);
+    if (error !== null) {
+      throw new StorageError(`could not read ${table} from Supabase: ${error.message}`, error);
+    }
+    if (count === null || count === undefined) {
+      // Asked for `count: 'exact'` and did not get one. Without it there is no
+      // way to know whether this page is the whole table, and guessing is the
+      // bug this function exists to remove.
+      throw new StorageError(
+        `could not read ${table} from Supabase: the server returned no row count, so a complete read cannot be confirmed`,
+      );
+    }
+    if (expected === null) {
+      expected = count;
+    } else if (count !== expected) {
+      throw new StorageError(
+        `could not read ${table} from Supabase: the row count changed from ${expected} to ${count} while reading, so the pages do not describe one state`,
+      );
+    }
+
+    // Without generated database types the client types a runtime column list
+    // as `GenericStringError[]`, so the narrowing has to go through `unknown`.
+    // The `Row` shapes above are the actual contract, and the integration suite
+    // is what checks they match the live schema.
+    const page = (data ?? []) as unknown as readonly Row[];
+    rows.push(...page);
+
+    if (rows.length >= expected) break;
+    if (page.length === 0) {
+      throw new StorageError(
+        `could not read ${table} from Supabase: the server stopped returning rows at ${rows.length} of ${expected}`,
+      );
+    }
   }
-  const { data, error } = await query;
-  if (error !== null) {
-    throw new Error(`could not read ${table} from Supabase: ${error.message}`);
+
+  if (rows.length !== expected) {
+    throw new StorageError(
+      `could not read ${table} from Supabase: got ${rows.length} rows where the server counted ${expected}`,
+    );
   }
-  // Without generated database types the client types a runtime column list
-  // as `GenericStringError[]`, so the narrowing has to go through `unknown`.
-  // The `Row` shapes above are the actual contract, and the integration suite
-  // is what checks they match the live schema.
-  return (data ?? []) as unknown as readonly Row[];
+  return rows;
 }
 
 function toOtl(row: OtlRow): Otl {
@@ -349,6 +441,23 @@ export function toStatePayload(state: StoredState): StatePayload {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether the signed-in account is approved, as the database sees it.
+ *
+ * Deliberately the RPC and not a select on `profiles`: the owner's
+ * `profiles_owner_reads_all` policy means a select returns EVERY profile row,
+ * so the adapter would have to know its own `auth.uid()` to pick the right
+ * one. `is_approved()` already does that server-side, and it is the identical
+ * expression the policies themselves evaluate.
+ */
+async function isApproved(client: SupabaseClient): Promise<boolean> {
+  const { data, error } = await client.rpc(APPROVED_RPC);
+  if (error !== null && error !== undefined) {
+    throw new StorageError(`could not check approval in Supabase: ${error.message}`, error);
+  }
+  return data === true;
+}
+
+/**
  * Binds the adapter to a signed-in Supabase client. The client is injected
  * rather than imported so this module never reaches for `import.meta.env`,
  * and so the unit tests can drive it without a network or a project.
@@ -359,8 +468,9 @@ export function createSupabaseAdapter(client: SupabaseClient): StorageAdapter {
       // Eight independent reads; none of them depends on another's result, so
       // they go out together rather than as eight serial round trips to a
       // remote region.
-      const [otls, people, statHolidays, allocations, leave, overrides, schedule, meta] =
+      const [approved, otls, people, statHolidays, allocations, leave, overrides, schedule, meta] =
         await Promise.all([
+          isApproved(client),
           selectOrdered<OtlRow>(client, 'otls', OTL_COLUMNS, [{ column: 'project_code' }]),
           selectOrdered<PersonRow>(client, 'people', PEOPLE_COLUMNS, [{ column: 'id' }]),
           selectOrdered<StatHolidayRow>(client, 'stat_holidays', STAT_HOLIDAY_COLUMNS, [
@@ -393,6 +503,26 @@ export function createSupabaseAdapter(client: SupabaseClient): StorageAdapter {
           selectOrdered<MetaRow>(client, 'meta', META_COLUMNS, [{ column: 'owner_id' }]),
         ]);
 
+      // A denied read must NOT look like an empty account.
+      //
+      // RLS refuses a select by returning no rows, not by raising, so a revoked
+      // admin's eight selects all succeed and all come back empty — exactly
+      // what a brand-new approved account looks like. Handing that back as an
+      // empty `StoredState` is the top of a data-loss path: the app shows a
+      // blank grid, the user types one character, the debounced `write` fires,
+      // and `replace_state` makes the blank state the account's real state.
+      //
+      // So approval is decided HERE, from `profiles` via `is_approved()`, and
+      // never from "the read came back empty". The two facts are now
+      // distinguishable by the caller: a `StorageError` with code 42501 means
+      // "not approved", and an empty `StoredState` means "genuinely empty".
+      if (!approved) {
+        throw new StorageError(
+          'this account is not approved to read its state',
+          { code: INSUFFICIENT_PRIVILEGE },
+        );
+      }
+
       const model: Model = {
         otls: otls.map(toOtl),
         people: people.map(toPerson),
@@ -419,7 +549,11 @@ export function createSupabaseAdapter(client: SupabaseClient): StorageAdapter {
     async write(state: StoredState): Promise<void> {
       const { error } = await client.rpc(WRITE_RPC, { state: toStatePayload(state) });
       if (error !== null) {
-        throw new Error(`could not write state to Supabase: ${error.message}`);
+        // `code` is carried, not flattened into the message. A revoked account
+        // hits 42501 here, and the caller has to be able to route that to the
+        // pending/revoked screen without matching on the English of
+        // `new row violates row-level security policy for table "otls"`.
+        throw new StorageError(`could not write state to Supabase: ${error.message}`, error);
       }
     },
   };
