@@ -6,17 +6,21 @@ full design (sections 5–7 cover isolation, storage, and schema).
 
 Project: https://qhgvkgayadeicnrnuiuu.supabase.co
 
-## What's in this migration, and what isn't
+## The migrations, in order
 
 `migrations/0001_schema.sql` creates the eight domain tables that every `Model` field
 (`src/domain/types.ts`) round-trips through: `otls`, `people`, `stat_holidays`,
 `allocations`, `leave_ranges`, `overrides`, `schedule`, `meta`.
 
-It does **not** create the `profiles` table (email/approval/owner bookkeeping) and it does
-**not** enable Row Level Security or write any policies. Both are later, separate tasks in
-this plan, on purpose — RLS is the property the whole multi-admin design rests on and gets
-its own review. **Do not point the app at this schema until RLS is applied**: without it,
-any authenticated session can read and write any owner's rows.
+`migrations/0002_profiles.sql` adds `profiles` (email/approval/owner bookkeeping) and the
+sign-up trigger that populates it.
+
+`migrations/0003_rls.sql` enables Row Level Security and writes the policies. Each was a
+separate task on purpose — RLS is the property the whole multi-admin design rests on and
+got its own review.
+
+**Until `0003_rls.sql` is applied, do not point the app at this schema.** Without policies,
+isolation between admins does not exist.
 
 ## Applying migrations
 
@@ -55,8 +59,9 @@ application code or CI secrets.
 Every table's `owner_id` references `auth.users(id) on delete cascade`. Deleting a user row
 in the Supabase dashboard (Authentication → Users) deletes every row that user owns across
 all eight tables. This is deliberate and is the **only** path in the system that destroys
-data — revoking an admin's access (setting `approved = false`, once `profiles`/RLS exist)
-does not touch their rows. Treat deleting a user as irreversible.
+data — revoking an admin's access (setting `profiles.approved = false`) does not touch their
+rows; it only makes them unreachable, and re-approving restores access exactly as it was.
+Treat deleting a user as irreversible.
 
 ## Verifying the applied schema
 
@@ -95,6 +100,35 @@ order by 1;
 -- auth.users and reference its id) — do not leave test rows behind.
 ```
 
+After applying `0003_rls.sql`, also run:
+
+```sql
+-- Expect rowsecurity = true for all 9 tables. A false here is a data leak.
+select tablename, rowsecurity from pg_tables
+where schemaname = 'public' order by 1;
+
+-- Expect 35 policies: 4 on each of the 8 domain tables, 3 on profiles.
+select tablename, policyname, cmd, qual, with_check from pg_policies
+where schemaname = 'public' order by tablename, policyname;
+
+-- Expect prosecdef = t, provolatile = s, proconfig = {search_path=public}
+-- for both. Any of the three missing is a real weakness, not a nit.
+select proname, prosecdef, provolatile, proconfig from pg_proc
+where proname in ('is_approved', 'is_account_owner') order by 1;
+```
+
+To test isolation by hand, impersonate a user in the SQL Editor rather than trusting the
+app — the SQL Editor connects as a superuser, which **bypasses RLS entirely**, so a query
+run plainly there proves nothing:
+
+```sql
+begin;
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"<a user id>","role":"authenticated"}';
+select * from people;   -- only that user's rows, and only if they are approved
+rollback;
+```
+
 ## `migrations/0002_profiles.sql`
 
 Creates `profiles(id, email, approved, is_owner, created_at)` and a trigger that inserts a
@@ -112,10 +146,54 @@ to `public.profiles` from a trigger on `auth.users`, a table the signing-up user
 otherwise touch. Omitting the explicit `search_path` on a `security definer` function is a
 known privilege-escalation vector and must not be dropped in a future edit.
 
-This migration does **not** enable RLS or write policies on `profiles` — that is Task 3,
-deliberately separate so the isolation model gets its own review. Until then, `profiles` is
-readable by anyone holding a valid session, the same known gap already noted above for the
-eight domain tables. **Do not point the app at this schema until RLS is applied.**
+This migration does not enable RLS or write policies on `profiles` — that is
+`migrations/0003_rls.sql`, deliberately separate so the isolation model got its own review.
+
+## `migrations/0003_rls.sql`
+
+Row Level Security and the policies. This is the migration the whole design rests on:
+isolation between admins is a property of the database, not of application code.
+
+Two helper functions, both `security definer stable set search_path = public`:
+
+- `is_approved()` — reads `profiles.approved` for `auth.uid()`, defaulting to false.
+- `is_account_owner()` — reads `profiles.is_owner` for `auth.uid()`, defaulting to false.
+
+`security definer` is required, not stylistic: the functions read `profiles`, which itself
+has RLS, so an inline subquery would either apply a second needless gate or — inside the
+policies on `profiles` — abort the query with
+`42P17: infinite recursion detected in policy for relation "profiles"`. `stable` lets
+Postgres evaluate the check once per statement rather than once per row, which matters on
+`schedule`. The explicit `search_path` is a privilege-escalation guard and must not be
+dropped in a future edit.
+
+Each of the eight domain tables gets four policies — select, insert, update, delete — all
+testing `owner_id = auth.uid() and is_approved()`. Update policies carry **both** `using`
+and `with check`: `using` decides which rows may be targeted, `with check` decides what
+they may become. With `using` alone, an admin could `update ... set owner_id = <someone
+else>` and move a row into another account. The policies are written out per table rather
+than generated in a loop, so any one table's guarantee is readable in isolation.
+
+`profiles` is deliberately different — three policies, not four:
+
+- `profiles_self_read` — anyone reads their own row. Note there is **no** `is_approved()`
+  term: an unapproved account must be able to read its own row, or the app cannot tell it
+  apart from an approved one and cannot show the "awaiting approval" screen.
+- `profiles_owner_reads_all` — the owner reads every row (the approval queue).
+- `profiles_owner_updates` — the owner updates other people's rows only. The
+  `id <> auth.uid()` term is what stops the owner revoking themselves, which would leave
+  the instance unadministrable with no recovery path short of hand-editing the database.
+
+There is no insert and no delete policy on `profiles`, so no one can create or destroy a
+profile through the API. Rows appear only via `handle_new_user()` (`security definer`, so
+not subject to these policies) and disappear only by `on delete cascade` when the
+`auth.users` row is deleted from the dashboard.
+
+Note: Supabase ships an `ensure_rls` event trigger (`rls_auto_enable`) that runs
+`alter table ... enable row level security` on every table created in `public`, so RLS was
+already on for all nine tables before this migration — with no policies, which is
+default-deny. `0003_rls.sql` re-asserts `enable row level security` anyway, so the guarantee
+is legible from that one file and does not depend on a platform trigger continuing to exist.
 
 ## Bootstrapping the owner account
 
