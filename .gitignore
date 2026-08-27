@@ -11,3 +11,7 @@ test-results/
 
 # Tool artifact: local code index, not project source.
 .codebase-index-cache.json
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
