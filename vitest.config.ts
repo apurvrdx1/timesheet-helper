@@ -23,7 +23,6 @@ export default defineConfig({
         '**/*.test.ts',
         '**/*.test.tsx',
         'src/test-setup.ts',
-        'apps-script/**',
         '**/*.integration.test.ts',
       ],
     },

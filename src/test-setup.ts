@@ -11,10 +11,10 @@ afterEach(() => {
   cleanup();
 });
 
-// jsdom does not implement <dialog>'s showModal()/close() (Task 15's
-// ConnectionSettings uses Astryx's Dialog, which is a real <dialog>
-// element) — without this polyfill every test that renders it fails with
-// "dialog.showModal is not a function" before any assertion runs.
+// jsdom does not implement <dialog>'s showModal()/close(), and several
+// Astryx components (LeaveDialog's Dialog, AdminPage's AlertDialog) render a
+// real <dialog> element — without this polyfill every test that renders one
+// fails with "dialog.showModal is not a function" before any assertion runs.
 if (typeof HTMLDialogElement !== 'undefined' && !HTMLDialogElement.prototype.showModal) {
   HTMLDialogElement.prototype.showModal = function showModal(this: HTMLDialogElement): void {
     this.setAttribute('open', '');
