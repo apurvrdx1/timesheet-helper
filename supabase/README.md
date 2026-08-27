@@ -95,10 +95,52 @@ order by 1;
 -- auth.users and reference its id) — do not leave test rows behind.
 ```
 
+## `migrations/0002_profiles.sql`
+
+Creates `profiles(id, email, approved, is_owner, created_at)` and a trigger that inserts a
+row whenever someone signs up (`auth.users` insert → `handle_new_user()` → `profiles`
+insert). Every new row defaults to `approved = false, is_owner = false` — registration
+grants nothing until the owner approves it.
+
+A partial unique index, `one_owner_only`, makes a second `is_owner = true` row impossible at
+the database level: `create unique index one_owner_only on profiles (is_owner) where
+is_owner;`. This is not application-level validation — Postgres rejects the write outright
+with a `23505 duplicate key value violates unique constraint "one_owner_only"` error.
+
+`handle_new_user()` is `security definer` with `set search_path = public`, because it writes
+to `public.profiles` from a trigger on `auth.users`, a table the signing-up user cannot
+otherwise touch. Omitting the explicit `search_path` on a `security definer` function is a
+known privilege-escalation vector and must not be dropped in a future edit.
+
+This migration does **not** enable RLS or write policies on `profiles` — that is Task 3,
+deliberately separate so the isolation model gets its own review. Until then, `profiles` is
+readable by anyone holding a valid session, the same known gap already noted above for the
+eight domain tables. **Do not point the app at this schema until RLS is applied.**
+
 ## Bootstrapping the owner account
 
-Not part of this migration (needs `profiles`, added in a later task) but documented here
-since it's a manual, one-time step: the very first account cannot be approved by anyone,
-because no owner exists yet. Its `approved` and `is_owner` flags must be set by hand in the
-Supabase dashboard (Table Editor → `profiles`). There is deliberately no in-app path to
-create an owner.
+The first account cannot be approved by anyone, because no owner exists yet. This is a
+required, one-time, by-hand step, and there is deliberately no in-app path to create an
+owner — an app that can mint its own owner can be tricked into minting someone else's.
+
+1. Have the person who will run this instance sign up normally through the app (or via
+   Authentication → Add user in the dashboard) with their real email.
+2. Find their user id — either Authentication → Users in the dashboard, or in the SQL
+   Editor:
+   ```sql
+   select id, email from auth.users where email = 'THEIR_EMAIL';
+   ```
+3. In the SQL Editor, run once:
+   ```sql
+   update profiles set approved = true, is_owner = true where email = 'THEIR_EMAIL';
+   ```
+4. Confirm it took:
+   ```sql
+   select email, approved, is_owner from profiles where email = 'THEIR_EMAIL';
+   -- expect approved = true, is_owner = true
+   ```
+
+If this is run a second time against a different email while an owner already exists, the
+`one_owner_only` index refuses the write — see `migrations/0002_profiles.sql` above. That
+failure is expected: only one owner may ever exist, and changing who holds the role means
+first clearing the flag on the current owner in the same session.
