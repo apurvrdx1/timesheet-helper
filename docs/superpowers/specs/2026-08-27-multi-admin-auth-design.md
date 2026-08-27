@@ -168,7 +168,7 @@ One table per domain collection, each with `owner_id`:
 | `people` | `owner_id`, `id`, `name`, `role`, `manager_id` |
 | `stat_holidays` | `owner_id`, `date`, `name`, `otl_project_code` |
 | `allocations` | `owner_id`, `month`, `otl_project_code`, `person_id` (nullable — null marks an OTL monthly total), `hours` |
-| `leave` | `owner_id`, `person_id`, `start_date`, `end_date`, `otl_project_code` |
+| `leave_ranges` | `owner_id`, `person_id`, `start_date`, `end_date`, `otl_project_code` |
 | `overrides` | `owner_id`, `person_id`, `date`, `otl_project_code`, `hours` |
 | `schedule` | `owner_id`, `person_id`, `date`, `otl_project_code`, `blocks`, `source`, `override_blocks` |
 | `meta` | `owner_id`, `model_hash`, `last_calculated_at` |
