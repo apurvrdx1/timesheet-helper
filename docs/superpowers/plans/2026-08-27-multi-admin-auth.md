@@ -1044,3 +1044,14 @@ rather than the `profile: null` the task requires.
 **ADD to Global Constraints:** `import.meta.env.VITE_*` types as `any` through
 `vite/client`'s index signature, so reading it directly violates the no-`any` rule. Use a
 narrowing helper such as `function requireEnv(name: string): string`.
+
+## A20 — ordering defect between A2 and A17 (found while dispatching Task 7)
+
+A2 assigns `0004_widen_keys.sql` to Task 8; A17 says add `email_confirmed_at` "in 0004" and
+have **Task 7** gate Approve on it. Task 7 runs first, so it would depend on a migration
+that does not exist yet.
+
+**SPLIT THEM.** Task 7 creates `supabase/migrations/0004_email_verified.sql` — copy
+`email_confirmed_at` onto `profiles` via a trigger on `auth.users` UPDATE, and backfill any
+existing rows. Task 8 creates `supabase/migrations/0005_widen_keys.sql` — the two PK
+widenings from A2. Each task owns the migration it needs.
