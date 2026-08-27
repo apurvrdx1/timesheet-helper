@@ -75,6 +75,14 @@ interface Failures {
    * actually hands over. Models a read that can never be completed.
    */
   readonly countSays?: number;
+  /**
+   * Row count the server reports from the SECOND page onwards. Models another
+   * session writing to the account between pages — the pages then describe two
+   * different states, which is a torn read and not a state.
+   */
+  readonly countChangesTo?: number;
+  /** `is_approved()` itself fails. */
+  readonly approvalError?: string;
 }
 
 /**
@@ -107,6 +115,7 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
   const selects: SelectCall[] = [];
   const rpcs: RpcCall[] = [];
   const maxRows = failures.maxRows ?? Number.POSITIVE_INFINITY;
+  const pagesServed: Record<string, number> = {};
 
   const client = {
     from(table: string) {
@@ -158,10 +167,15 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
             : all.map((row) => Object.fromEntries(wanted.map((column) => [column, row[column]])));
           const [from, to] = ranges[ranges.length - 1] ?? [0, Number.POSITIVE_INFINITY];
           const page = projected.slice(from, to + 1).slice(0, maxRows);
+          const served = (pagesServed[table] ?? 0) + 1;
+          pagesServed[table] = served;
+          const reported = served > 1 && failures.countChangesTo !== undefined
+            ? failures.countChangesTo
+            : (failures.countSays ?? all.length);
           return Promise.resolve({
             data: page,
             error: null,
-            count: exactCount ? (failures.countSays ?? all.length) : null,
+            count: exactCount ? reported : null,
           }).then(onFulfilled);
         },
       };
@@ -170,7 +184,14 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
     rpc(fn: string, args?: Record<string, unknown>) {
       rpcs.push({ fn, args: args ?? {} });
       if (fn === APPROVED_RPC) {
-        return Promise.resolve({ data: failures.notApproved !== true, error: null });
+        return Promise.resolve(
+          failures.approvalError === undefined
+            ? { data: failures.notApproved !== true, error: null }
+            : {
+              data: null,
+              error: { message: failures.approvalError, code: '08006', details: null, hint: null },
+            },
+        );
       }
       return Promise.resolve(
         failures.rpc === undefined
@@ -567,6 +588,41 @@ describe('createSupabaseAdapter().read', () => {
     await expect(createSupabaseAdapter(fake.client).read()).rejects.toThrow(
       /stopped returning rows at 2 of 99/,
     );
+  });
+
+  it('refuses a torn read when the count changes between pages', async () => {
+    // Two pages that describe two different states are not one state. The
+    // fake serves 7 rows behind a ceiling of 3 and then changes its mind about
+    // how many there are, which is what another session writing to the account
+    // mid-read looks like from here.
+    const many = Array.from({ length: 7 }, (_, i) => ({
+      person_id: 'rep', date: `2026-01-0${i + 1}`, otl_project_code: 'CAP-1',
+      blocks: 15, source: 'CALC', override_blocks: 0,
+    }));
+    const fake = fakeClient({ ...FULL_TABLES, schedule: many }, { maxRows: 3, countChangesTo: 9 });
+    await expect(createSupabaseAdapter(fake.client).read()).rejects.toThrow(
+      /row count changed from 7 to 9 while reading/,
+    );
+  });
+
+  it('refuses a read that came back longer than the server counted', async () => {
+    // The other direction of the same disagreement. Belt and braces: the loop
+    // above should never leave this reachable, and if it ever does the answer
+    // is still "do not hand this to a caller who is about to write it back".
+    const fake = fakeClient(FULL_TABLES, { countSays: 1 });
+    await expect(createSupabaseAdapter(fake.client).read()).rejects.toThrow(
+      /got 2 rows where the server counted 1/,
+    );
+  });
+
+  it('throws when the approval check itself fails', async () => {
+    // Not the same as "not approved". If the question could not be asked, the
+    // adapter must not answer it optimistically.
+    const fake = fakeClient(FULL_TABLES, { approvalError: 'connection failure' });
+    const failure = await createSupabaseAdapter(fake.client).read().catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(StorageError);
+    expect((failure as StorageError).message).toMatch(/could not check approval in Supabase/);
+    expect((failure as StorageError).code).toBe('08006');
   });
 
   it('throws when the server returns no row count at all', async () => {
