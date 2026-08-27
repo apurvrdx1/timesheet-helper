@@ -19,6 +19,10 @@ sign-up trigger that populates it.
 separate task on purpose — RLS is the property the whole multi-admin design rests on and
 got its own review.
 
+`migrations/0005_widen_keys.sql` widens two of 0001's primary keys, which were narrower
+than the domain allows, and adds `replace_state(jsonb)` — the single `security invoker`
+function through which the app performs every write.
+
 **Until `0003_rls.sql` is applied, do not point the app at this schema.** Without policies,
 isolation between admins does not exist.
 
@@ -214,12 +218,62 @@ already on for all nine tables before this migration — with no policies, which
 default-deny. `0003_rls.sql` re-asserts `enable row level security` anyway, so the guarantee
 is legible from that one file and does not depend on a platform trigger continuing to exist.
 
+## `migrations/0005_widen_keys.sql`
+
+Two changes, one migration, because the second cannot be correct without the first.
+
+**The widened keys.** `stat_holidays` was keyed `(owner_id, date)` — "one holiday per day".
+The domain disagrees: a `StatHoliday` names an `otl_project_code`, and two holidays on one
+date booking to different STAT OTLs is ordinary input. `leave_ranges` was keyed
+`(owner_id, person_id, start_date, otl_project_code)`, which omits `end_date`, so one
+person could not have two ranges starting the same day — which is exactly what splitting a
+week of vacation produces. Both were verified against the live project before the fix:
+each returned `23505 duplicate key value violates unique constraint`. The keys are now
+`(owner_id, date, otl_project_code)` and
+`(owner_id, person_id, start_date, end_date, otl_project_code)`. Widening a key can only
+accept rows a narrower one rejected, so it cannot fail on existing data.
+
+**`replace_state(jsonb)`.** The whole of the app's write, as one function. PostgREST gives
+one transaction per *request*, so a client that cleared the account with `.delete()` and
+then wrote it with `.insert()` would be making two of them: an insert that failed — on
+the 23505 above, on a dropped connection, on a closed laptop — would leave the delete
+committed and the account empty. That is a data-loss path, and removing one is the point of
+this whole schema. One `.rpc()` call is one request and one transaction: the account's
+entire state is replaced, or nothing changes.
+
+It is **`security invoker`**, and that is not a style choice. `security definer` would run
+the body as the function's owner, and an owner bypasses row-level security — every
+guarantee in `0003_rls.sql` would simply not apply inside it, and this one function would
+be a hole straight through the isolation model. As `security invoker` it runs as the
+caller, so the policies apply to its DELETEs and INSERTs exactly as they do to any other
+statement. Verified against the live project:
+
+| Attempt | Result |
+|---|---|
+| Unapproved account calls it | `42501 new row violates row-level security policy for table "otls"` |
+| Account B writes a state naming account A's project codes | Rows created, all owned by B; A's rows untouched |
+| Revoked account calls it | Refused, and the rows it already owns survive |
+| Write whose `schedule` rows violate `blocks > 0` | `23514`, and the prior state is intact — the DELETEs rolled back with it |
+
+`person_key` appears nowhere in the function. It is
+`generated always as (coalesce(person_id, '')) stored`, and naming it in an INSERT is
+`428C9 cannot insert a non-DEFAULT value into column "person_key"`. For the same reason
+`src/storage/supabase.ts` never uses `select('*')` — a star select returns the generated
+column, and a naive round trip would try to write it back.
+
+`execute` is granted to `authenticated` and revoked from `public`.
+
 ## Running the isolation suite
 
 `src/storage/rls.integration.test.ts` is the automated proof that the policies above
 actually isolate one admin from another. It runs against the **real** project — nothing in
 it is mocked, because a mock of the database would be a mock of the thing that enforces
 isolation, and it would pass just as happily with every policy dropped.
+
+`src/storage/supabase.integration.test.ts` runs alongside it, on the same fixtures pattern,
+and proves the storage adapter against the same real schema: the full state round trip, a
+null `Allocation.personId` surviving as null, `replace_state`'s atomicity forced by a
+constraint violation, and that the new RPC opened no cross-account path.
 
 ```bash
 npm run test:integration
@@ -270,9 +324,10 @@ narrowest credential that has it: the project's service-role key, in `beforeAll`
 
 ### What a run does to the project
 
-Creates four users (`rls-<run-id>-{alice,bob,pending,revoked}@example.test`), approves
-three of them, writes a handful of rows stamped with a per-run id, and deletes all four
-users at the end — then verifies no profile or domain row survived, failing loudly if one
+Creates four users (`rls-<run-id>-{alice,bob,pending,revoked}@example.test`) plus three
+more for the storage suite (`storage-<run-id>-{alice,bob,pending}@example.test`), approves
+five of the seven, writes a handful of rows stamped with a per-run id, and deletes all
+seven users at the end — then verifies no profile or domain row survived, failing loudly if one
 did. Every identifier is unique per run, so two runs at once cannot collide. A completed
 run leaves the project exactly as it found it:
 
@@ -287,7 +342,8 @@ select (select count(*) from auth.users) as users,
 If the suite is interrupted, teardown may not run. Sweep leftovers with:
 
 ```sql
-delete from auth.users where email like 'rls-%@example.test';
+delete from auth.users where email like 'rls-%@example.test'
+                       or email like 'storage-%@example.test';
 ```
 
 ## Bootstrapping the owner account
