@@ -845,3 +845,202 @@ Write what you found into the ledger, including anything that worked differently
 **Placeholder scan.** Tasks 5, 6, 7, 8 and 10 describe test cases in prose rather than full source, because their mocking depends on `@supabase/supabase-js`'s runtime shape, which must be read from the installed package rather than guessed — this project has twice been burned by trusting documentation over the shipped library. Each names the exact cases required. The SQL and the isolation suite, which carry the real risk, are given in full.
 
 **Type consistency.** `StorageAdapter` is redefined once in Task 8 and consumed in Task 9. `useSession`'s return shape is fixed in Task 5 and used in Tasks 6, 7 and 9. `profile.isOwner` is camelCase in TypeScript throughout, mapping to `is_owner` in SQL — the mapping is explicit in Task 8 and must not be automated.
+
+---
+
+# PLAN AMENDMENTS (2026-08-27)
+
+A review of the unexecuted half returned **BLOCK** with 19 findings. Tasks 1–3 also
+diverged from this plan in ways later tasks depend on. **These amendments supersede the
+task text above.** Every dispatch must carry the amendments for its task.
+
+## A1 — Task 8/9: the adapter interface cannot carry the schedule or the hash
+
+`Model` (`src/domain/types.ts`) is exactly six arrays. It holds NO `ScheduleEntry[]` and
+no hash. So `read(): Promise<Model>` cannot persist either — which would leave the
+`schedule` and `meta` tables permanently empty, make `isStale` uncleara ble across a
+reload, and rebuild v1's permanent-nag bug from scratch.
+
+**SUPERSEDES Task 8 Step 1.** The interface is:
+
+```ts
+export interface StoredState {
+  model: Model;
+  entries: ScheduleEntry[];
+  hash: string | null;
+}
+export interface StorageAdapter {
+  read(): Promise<StoredState>;
+  write(state: StoredState): Promise<void>;
+}
+```
+
+`src/domain/` still does not change — `StoredState` lives in the storage layer.
+
+## A2 — Task 8: `delete then insert` destroys data, and will fire
+
+PostgREST gives ONE transaction PER REQUEST. A delete and a following insert are two
+requests: if the insert fails, the delete has already committed and the rows are gone.
+Reintroducing a data-loss path into the change whose purpose is deleting one is the worst
+available outcome.
+
+It will fire, because two applied primary keys are narrower than the UI produces:
+`stat_holidays` is `(owner_id, date)` but two holidays on one date pointing at different
+STAT OTLs is legal; `leave_ranges` omits `end_date` but two ranges starting the same day
+is legal. Both are `23505` on write.
+
+**SUPERSEDES Task 8 Step 3.** Two parts:
+(a) New `supabase/migrations/0004_widen_keys.sql` — add `otl_project_code` to
+    `stat_holidays`' PK and `end_date` to `leave_ranges`'.
+(b) Replace the whole write with a SINGLE `security invoker` PL/pgSQL function taking the
+    state as `jsonb`, called via `.rpc()`. One request, one transaction, atomic. `security
+    invoker` so RLS still applies — do NOT use `security definer` here, which would bypass
+    the isolation this project is built on.
+
+## A3 — Task 9: the deletion list breaks the build
+
+`tsconfig.app.json` includes all of `src`, so tests are type-checked. Missing from the list:
+- `src/storage/store.test.ts` (1018 lines) — **REWRITE**, imports deleted modules but
+  carries surviving assertions
+- `src/storage/serialize.test.ts` (816 lines) — **DELETE**
+- `src/ui/App.test.tsx` (493 lines) — **REWRITE**, three describe blocks assert on
+  `dataNotice`/`unreadableTabs` which this task removes
+Also update `vitest.config.ts`'s `exclude: ['apps-script/**']`, which goes stale.
+
+## A4 — Task 9/10: `serialize.ts` contains no CSV code
+
+`grep -ci csv src/storage/serialize.ts` returns 0. The plan's "all that survives of
+serialize.ts" was invented. **`serialize.ts` is a FULL DELETE**; `src/storage/csv.ts` is
+net-new in Task 10. Remove the "your call, but say which" choice — there is none.
+
+## A5 — Task 9: the stated `useStore()` surface drops four fields App.tsx uses
+
+**SUPERSEDES Task 9's Interfaces block.** Produces:
+`{ model, result, isStale, needsAllocation, hasCertifiedSchedule, status, notice,
+   dataNotice→REMOVED, update, cancelPendingPush, recalculate }`
+Removed: `config`, `connect`, `disconnect`, `dataNotice`, `unreadableTabs`.
+Keep: `cancelPendingPush` (the ErrorBoundary's "nothing was saved over" promise depends on
+it), `needsAllocation` + `hasCertifiedSchedule` (the empty-state-vs-staleness split), and
+the `monthsOf` named export (`WeeksPage.tsx` imports it).
+
+## A6 — Task 12: the E2E is not idempotent
+
+It passes once. On run two the test account's rows persist: `OPEX-ADMIN` collides on the
+PK, a second "Alex" makes `getByLabel('Alex P-1001')` ambiguous, and the stale banner's
+presence depends on leftover state. CI runs this on every push.
+**ADD Task 12 Step 0:** sign up a fresh uniquely-stamped account per run, as
+`rls.integration.test.ts` already does. Also name where the unapproved-account fixture
+comes from and who keeps it unapproved.
+
+## A7 — Task 13: the isolation suite needs the service-role key, which the plan forbids
+
+The suite must approve accounts and delete users; the publishable key can do neither. But
+`supabase/README.md` and Task 1 say the service-role key must never be used "or in CI
+secrets". Flat contradiction.
+**RULING:** the prohibition is amended to be precise rather than absolute — *never in the
+bundle, never committed, never in application code; PERMITTED as a CI secret scoped to the
+isolation job only.* Update `supabase/README.md` to say exactly that. Also map the names:
+the suite reads `SUPABASE_URL`/`SUPABASE_ANON_KEY`, the repo secrets are
+`VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY`; write both sides out.
+
+## A8 — Task 13: env vars are wired to the wrong step
+
+`src/auth/client.ts` throws at module scope when they are absent, and `npm run coverage`
+and `npx playwright test` both run BEFORE the build step. Set
+`VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY` at **job** level, not on the build step.
+**ADD to Task 5:** state that unit tests must `vi.mock('./client')` — after Task 9 wraps
+App in `<AuthGate>`, that is every UI test.
+
+## A9 — Task 11: the keep-warm cron cannot work and cannot fail
+
+It references `secrets.SUPABASE_URL`/`SUPABASE_ANON_KEY`; the secrets that exist are
+`VITE_`-prefixed. A missing secret interpolates to empty, so the request 401s without
+touching Postgres — and `curl` without `--fail` means the job goes green anyway. The first
+symptom would be the paused project it exists to prevent.
+Use the `VITE_`-prefixed names and add `--fail-with-body`.
+
+## A10 — Task 11: paused projects produce TWO error shapes, not one
+
+Measured in `postgrest-js`: a fetch-level failure returns `status: 0` with
+`'TypeError: Failed to fetch'`; an HTTP 503 returns `status: 503`. Also
+`RETRYABLE_STATUS_CODES = [520, 503]` with retries ON by default and 1s/2s/4s backoff, so a
+503 takes ~7s to surface.
+Detect `status === 0 || status === 503 || status === 520`. Require TWO store tests, one per
+shape. Do not word the notice as if it were instant.
+
+## A11 — Task 8 commits a tree that cannot type-check
+
+Replacing `adapter.ts` wholesale in Task 8 breaks seven files that survive until Task 9,
+and Task 8's verification does not run `tsc`.
+**Task 8 declares the new interface in a NEW file `src/storage/modelAdapter.ts`** and
+leaves `adapter.ts` untouched; Task 9 deletes it. **ADD `npm run typecheck` to Task 8's
+verification.**
+
+## A12 — Task 10: nothing ever mounts `ExportMenu`
+
+Create-only file list means a tested component unreachable from the app, and Task 14's
+manual export check has nothing to click.
+**ADD `Modify: src/ui/pages/WeeksPage.tsx`** (it already renders `PersonWeekView`), plus a
+test asserting the export control is reachable from the person-week view.
+
+## A13 — Task 10: underspecified enough to build two incompatible things
+
+- `ExportRow` is never defined. **It is one OTL across a week:**
+  `{ projectCode, taskCode, expenditureTypeCode, timeReportingCode, mon, tue, wed, thu, fri, total }`
+  with the five day fields and `total` as `number`.
+- The zero rendering contradicts itself. **The rule is:** CSV renders zero as an EMPTY
+  cell (an em-dash in CSV becomes text, not a number, in a spreadsheet); the HTML table
+  renders zero as an em-dash, matching `formatHoursCell`.
+- jsdom implements neither `ClipboardItem`/`clipboard.write` nor `URL.createObjectURL`.
+  Both must be stubbed; say so rather than letting the implementer discover it.
+
+## A14 — Task 8: `allocations.person_key` is GENERATED ALWAYS STORED
+
+Added in Task 1 to work around the invalid PK; absent from this plan. Writing it is a hard
+error (`428C9`). **Select an explicit column list, never `*`. Never include `person_key` in
+any insert or upsert payload.** `person_id` remains what the app reads and writes, and null
+still means the OTL monthly total. If A2's RPC uses a conflict target it is
+`owner_id,month,otl_project_code,person_key` — the generated column names the index but
+must not appear in the payload.
+
+## A15 — Task 8: "numeric comes back as a string" is an unverified memory claim
+
+PostgREST serialises through Postgres' own JSON functions, which render `numeric` as an
+unquoted number. **MEASURE IT against the live project before writing the mock** — insert
+one row and log `typeof data[0].hours` — then build the mock to match. Coerce with
+`Number(...)` regardless. A mock that does not match the server is a test that proves
+nothing.
+
+## A16 — Spec §4.2 step 5: owner notification is unbuilt
+
+No task sends it, so approval depends on the owner spontaneously opening the Admin page.
+**RULING: drop the email.** Adding mail infrastructure for a handful of admins is scope
+creep. Instead **ADD to Task 9: a pending-count badge on the Admin tab**, so the owner sees
+"2 waiting" without opening it. Amend spec §4.2 step 5 accordingly.
+
+## A17 — Spec §10: two requirements unowned, one unenforceable
+
+- **Rate limiting** is a Supabase dashboard setting nothing configures. **ADD a step to
+  Task 14** documenting it (Auth → Rate Limits).
+- **"Email verification required before approval" cannot be met** — verification lives in
+  `auth.users.email_confirmed_at`, which is not on `profiles` and not visible to the
+  client, so the owner cannot tell a verified account from an unverified one.
+  **ADD to `0004_widen_keys.sql`: copy `email_confirmed_at` onto `profiles`** (trigger on
+  `auth.users` update), and **Task 7 disables Approve until it is non-null.**
+
+## A18 — Task 5: the async `onAuthStateChange` overload is deprecated
+
+`auth-js` 2.112.4 marks it deprecated — async callbacks can deadlock on a nested refresh
+from `TOKEN_REFRESHED`. **Use the synchronous callback**: set session state in it, and
+fetch the profile from a `useEffect` keyed on the user id. **Read the profile with
+`.maybeSingle()`, not `.single()`** — the `handle_new_user` trigger races the first client
+read, and `.single()` returns `PGRST116` on zero rows, which would surface as an error
+rather than the `profile: null` the task requires.
+
+## A19 — Task 5: two factual slips
+
+`@supabase/supabase-js` is ALREADY a dependency (Task 4 needed it) — do not reinstall.
+`.env.example` does not exist; the Files line should read **Create**, not Modify.
+**ADD to Global Constraints:** `import.meta.env.VITE_*` types as `any` through
+`vite/client`'s index signature, so reading it directly violates the no-`any` rule. Use a
+narrowing helper such as `function requireEnv(name: string): string`.
