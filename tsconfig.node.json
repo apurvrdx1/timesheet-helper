@@ -6,8 +6,15 @@
     "types": ["node"],
     "skipLibCheck": true,
 
-    /* Bundler mode */
-    "module": "nodenext",
+    /* Bundler mode. `bundler` rather than `nodenext` because Vitest runs
+       these files through Vite's transform, not through Node's own ESM
+       resolver -- and because the integration suites import app modules from
+       `src/`, which are written for the bundler resolution `tsconfig.app.json`
+       uses. Under `nodenext` every one of those modules' own extensionless
+       relative imports would have to gain a `.js` suffix purely to satisfy a
+       resolver nothing at runtime actually uses. */
+    "module": "esnext",
+    "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
