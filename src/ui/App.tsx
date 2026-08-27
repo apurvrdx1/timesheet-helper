@@ -23,6 +23,7 @@ import { Heading } from '@astryxdesign/core/Heading';
 import { Text } from '@astryxdesign/core/Text';
 import { Button } from '@astryxdesign/core/Button';
 import { Banner } from '@astryxdesign/core/Banner';
+import { Badge } from '@astryxdesign/core/Badge';
 import { TabList, Tab } from '@astryxdesign/core/TabList';
 import { StaleBanner } from './components/StaleBanner';
 import { SetupPage } from './pages/SetupPage';
@@ -31,6 +32,7 @@ import { WeeksPage } from './pages/WeeksPage';
 import { AdminPage } from './pages/AdminPage';
 import { AuthGate } from '../auth/AuthGate';
 import { useSession } from '../auth/useSession';
+import { usePendingCount } from '../auth/usePendingCount';
 import { useStore } from '../storage/store';
 import type { StoreStatus } from '../storage/store';
 import type { IsoMonth, Model } from '../domain/types';
@@ -224,6 +226,11 @@ export function Planner() {
   // the manager's place instead of resetting to the current month.
   const [month, setMonth] = useState<IsoMonth>(() => currentMonth());
 
+  // A16: the badge that replaced the spec's owner-notification email. Keyed
+  // on the active tab so that leaving the Admin page after approving someone
+  // re-counts, rather than leaving a stale number on the tab.
+  const pendingCount = usePendingCount(isOwner, activeTab);
+
   // AllocationsPage/WeeksPage take `update` as "apply this whole next
   // model" — the store's `update` takes an updater function instead, so
   // this adapts one shape to the other in exactly one place.
@@ -300,7 +307,17 @@ export function Planner() {
                   AdminPage reads and writes is behind `profiles_owner_reads_all`
                   and `profiles_owner_updates` — so hiding the tab is the UI
                   matching the schema, not the only guard. */}
-              {isOwner && <Tab value="admin" label="Admin" />}
+              {isOwner && (
+                <Tab
+                  value="admin"
+                  label="Admin"
+                  endContent={
+                    pendingCount !== null && pendingCount > 0 ? (
+                      <Badge variant="warning" label={`${pendingCount} waiting`} />
+                    ) : undefined
+                  }
+                />
+              )}
             </TabList>
             {/* Keyed by tab so moving to another tab clears a caught error
                 and remounts that page: the way out of a domain constraint

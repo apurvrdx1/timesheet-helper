@@ -34,9 +34,11 @@ const adapterControl = vi.hoisted(() => {
   };
 });
 
-/** The rows `AdminPage`'s `profiles` query resolves to. */
+/** What the mocked `profiles` queries resolve to: rows for `AdminPage`'s
+ *  listing, and a count for `usePendingCount`'s head query. */
 const profilesControl = vi.hoisted(() => ({
   rows: [] as unknown[],
+  count: 0,
 }));
 
 vi.mock('../storage/supabase', () => ({
@@ -47,21 +49,35 @@ vi.mock('../storage/supabase', () => ({
 }));
 
 vi.mock('../auth/client', () => {
-  interface Chain {
+  // Every PostgREST builder method returns the same thenable, so a caller can
+  // chain in any order and `await` at any point — which is what `AdminPage`
+  // (`select().order().order()`, `update().eq()`) and `usePendingCount`
+  // (`select().eq().not()`) between them require.
+  interface Result {
+    data: unknown;
+    error: null;
+    count: number;
+  }
+  interface Chain extends PromiseLike<Result> {
     select: () => Chain;
     order: () => Chain;
     update: () => Chain;
-    eq: () => Promise<{ data: unknown; error: null }>;
-    then: Promise<{ data: unknown; error: null }>['then'];
+    eq: () => Chain;
+    not: () => Chain;
   }
   const makeChain = (): Chain => {
-    const settled = Promise.resolve({ data: profilesControl.rows, error: null });
+    const settled = Promise.resolve({
+      data: profilesControl.rows,
+      error: null,
+      count: profilesControl.count,
+    });
     const chain: Chain = {
       select: () => chain,
       order: () => chain,
       update: () => chain,
-      eq: () => settled,
-      then: settled.then.bind(settled),
+      eq: () => chain,
+      not: () => chain,
+      then: (onFulfilled, onRejected) => settled.then(onFulfilled, onRejected),
     };
     return chain;
   };
@@ -180,6 +196,7 @@ afterEach(() => {
 beforeEach(() => {
   adapterControl.reset();
   profilesControl.rows = [];
+  profilesControl.count = 0;
   signedIn();
 });
 
@@ -378,8 +395,31 @@ describe('App: the Admin tab is the owner’s alone', () => {
     render(<App />);
     await settle();
 
-    await openTab(/^admin$/i);
+    await openTab(/admin/i);
     expect(screen.getByRole('heading', { name: /accounts/i })).toBeInTheDocument();
+  });
+
+  // A16: the spec's owner-notification email was dropped, and this is what
+  // replaced it. Without a count on the tab, approving depends on the owner
+  // spontaneously opening a page they have no reason to open.
+  it('carries the number of accounts waiting, so the owner does not have to look', async () => {
+    signedIn({ isOwner: true });
+    profilesControl.count = 2;
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText('2 waiting')).toBeInTheDocument();
+  });
+
+  it('shows no badge when nobody is waiting', async () => {
+    signedIn({ isOwner: true });
+    profilesControl.count = 0;
+
+    render(<App />);
+    await settle();
+
+    expect(screen.queryByText(/waiting/i)).not.toBeInTheDocument();
   });
 });
 
