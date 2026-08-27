@@ -1,7 +1,81 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { Session, User } from '@supabase/supabase-js';
+
+// ---------------------------------------------------------------------------
+// Mocks
+//
+// `App` now renders behind `AuthGate` and its store reads through Supabase,
+// so three modules have to be stood in for. `client.ts` throws at module
+// scope when the env vars are absent (A8's rule: every test whose import
+// graph reaches it must mock it), `useSession` decides what the gate does,
+// and `createSupabaseAdapter` is the store's one door to the network.
+// ---------------------------------------------------------------------------
+
+/**
+ * The stored state the mocked adapter hands back, and what it does with a
+ * write. Hoisted so the `vi.mock` factories below — which run before this
+ * file's own top-level statements — can close over it, and mutable so each
+ * test can set the account's contents before rendering.
+ */
+const adapterControl = vi.hoisted(() => {
+  const emptyModel = {
+    otls: [], people: [], statHolidays: [], allocations: [], leave: [], overrides: [],
+  };
+  return {
+    read: (): Promise<unknown> => Promise.resolve({ model: emptyModel, entries: [], hash: null }),
+    write: (_state: unknown): Promise<void> => Promise.resolve(),
+    reset(): void {
+      this.read = () => Promise.resolve({ model: emptyModel, entries: [], hash: null });
+      this.write = () => Promise.resolve();
+    },
+  };
+});
+
+/** The rows `AdminPage`'s `profiles` query resolves to. */
+const profilesControl = vi.hoisted(() => ({
+  rows: [] as unknown[],
+}));
+
+vi.mock('../storage/supabase', () => ({
+  createSupabaseAdapter: () => ({
+    read: () => adapterControl.read(),
+    write: (state: unknown) => adapterControl.write(state),
+  }),
+}));
+
+vi.mock('../auth/client', () => {
+  interface Chain {
+    select: () => Chain;
+    order: () => Chain;
+    update: () => Chain;
+    eq: () => Promise<{ data: unknown; error: null }>;
+    then: Promise<{ data: unknown; error: null }>['then'];
+  }
+  const makeChain = (): Chain => {
+    const settled = Promise.resolve({ data: profilesControl.rows, error: null });
+    const chain: Chain = {
+      select: () => chain,
+      order: () => chain,
+      update: () => chain,
+      eq: () => settled,
+      then: settled.then.bind(settled),
+    };
+    return chain;
+  };
+  return { supabase: { from: () => makeChain(), auth: { signOut: vi.fn() } } };
+});
+
+vi.mock('../auth/useSession', () => ({ useSession: vi.fn() }));
+
+import { useSession } from '../auth/useSession';
+import type { Profile, UseSessionResult } from '../auth/useSession';
 import { App, ErrorBoundary, planNoticeBanner } from './App';
+import type { Model, ScheduleEntry } from '../domain/types';
+
+const mockedUseSession = useSession as unknown as Mock<() => UseSessionResult>;
 
 // jsdom (this project's `src/test-setup.ts`, which this file must not edit
 // per the storage-isolation constraint other page tests document) does not
@@ -24,6 +98,69 @@ if (typeof window.matchMedia !== 'function') {
     }) as MediaQueryList;
 }
 
+const EMPTY_MODEL: Model = {
+  otls: [], people: [], statHolidays: [], allocations: [], leave: [], overrides: [],
+};
+
+/** A model that plainly implies a schedule but allocates nothing. */
+const NOTHING_ALLOCATED: Model = {
+  ...EMPTY_MODEL,
+  otls: [{
+    projectCode: 'OPEX-ADMIN', taskCode: 'T0', expenditureTypeCode: 'E0',
+    timeReportingCode: 'R0', category: 'OPEX', leaveSubtype: null,
+    isDefaultOpex: true, colorIndex: 1, active: true,
+  }],
+  people: [{ id: 'p1', name: 'Alex', role: 'MANAGER', managerId: null }],
+  overrides: [{ personId: 'p1', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN', hours: 7.5 }],
+};
+
+const A_SCHEDULE_ENTRY: ScheduleEntry = {
+  personId: 'p1', date: '2026-09-07', otlProjectCode: 'OPEX-ADMIN',
+  blocks: 2, source: 'OVERRIDE', overrideBlocks: 2,
+};
+
+function storedState(model: Model, entries: ScheduleEntry[] = [], hash: string | null = null) {
+  return { model, entries, hash };
+}
+
+function makeUser(id: string, email: string): User {
+  return {
+    id,
+    email,
+    app_metadata: {},
+    user_metadata: {},
+    aud: 'authenticated',
+    created_at: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+function makeSession(id: string, email: string): Session {
+  return {
+    access_token: 'access-token',
+    refresh_token: 'refresh-token',
+    expires_in: 3600,
+    token_type: 'bearer',
+    user: makeUser(id, email),
+  };
+}
+
+function makeProfile(overrides: Partial<Profile> = {}): Profile {
+  return { id: 'user-1', email: 'alex@example.com', approved: true, isOwner: false, ...overrides };
+}
+
+const signOut = vi.fn(async () => {});
+
+/** Signs in an approved, non-owner account — the default for these tests. */
+function signedIn(profile: Partial<Profile> = {}): void {
+  const full = makeProfile(profile);
+  mockedUseSession.mockReturnValue({
+    session: makeSession(full.id, full.email),
+    profile: full,
+    loading: false,
+    signOut,
+  });
+}
+
 // The Astryx neutral theme's CSS (theme-neutral/theme.css) is written as
 // `@scope ([data-astryx-theme="neutral"]) to ([data-astryx-theme])` — most of
 // its rules only apply inside that scope. `<Theme theme={neutralTheme}>` is
@@ -37,23 +174,23 @@ afterEach(() => {
   cleanup();
   document.documentElement.removeAttribute('data-astryx-theme');
   document.documentElement.removeAttribute('data-theme');
+  vi.clearAllMocks();
 });
 
 beforeEach(() => {
-  localStorage.clear();
+  adapterControl.reset();
+  profilesControl.rows = [];
+  signedIn();
 });
 
 /**
- * `useStore()`'s mount effect reads through the configured adapter — a real
- * async chain of microtasks (`await adapter.read(...)`, then several
- * `setState` calls) with no observable UI signal on an empty cache (no
- * banner, no spinner — DESIGN.md §4 "Loading" bans one for local
- * computation). store.test.ts gets the same ordering guarantee via
- * `waitFor(() => status === 'idle')`, which isn't available from outside the
- * hook; flushing a macrotask (after every already-queued microtask has run)
- * is the App-level equivalent. Without this, a test that both changes store
- * state and asserts on it immediately after mount races the mount effect's
- * own `setLastCalculatedHash` / `setModel` calls.
+ * `useStore()`'s mount effect reads the account's state — a real async chain
+ * of microtasks (`await adapter.read()`, then several `setState` calls) with
+ * no observable UI signal on an empty account (no banner, no spinner —
+ * DESIGN.md §4 "Loading" bans one for local computation). store.test.ts gets
+ * the same ordering guarantee via `waitFor(() => status === 'idle')`, which
+ * isn't available from outside the hook; flushing a macrotask (after every
+ * already-queued microtask has run) is the App-level equivalent.
  */
 async function settle(): Promise<void> {
   await act(async () => {
@@ -187,29 +324,88 @@ describe('App', () => {
   });
 });
 
-/** The local adapter's own storage key — the backend App reads through on
- * mount, not the client-side cache. */
-const LOCAL_ADAPTER_KEY = 'timesheet-helper:payload:v1';
+describe('App: the account it is signed in as', () => {
+  it('shows the signed-in address and a way out, in place of the old connection settings', async () => {
+    render(<App />);
+    await settle();
 
-describe('App: a data-integrity problem is never suppressed', () => {
-  it('shows the unreadable tab and the Recalculate action in one banner', async () => {
-    // One capital R in the People header: the whole tab drops, and the Meta
-    // hash was written against the intact model, so the schedule reads as
-    // stale on exactly this load. The user used to see the stale banner and
-    // nothing at all about the tab that had just vanished.
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify({
-      People: [['id', 'name', 'Role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
-    }));
+    expect(screen.getByText('alex@example.com')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /connection settings/i })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /sign out/i }));
+    expect(signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders nothing of the planner until the gate lets someone through', () => {
+    mockedUseSession.mockReturnValue({ session: null, profile: null, loading: false, signOut });
+    render(<App />);
+
+    expect(screen.getByRole('heading', { name: /sign in/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^setup$/i })).not.toBeInTheDocument();
+  });
+
+  it('does not read the account for a session the gate turned away', async () => {
+    // The read is the thing that makes the store safe to write, and an
+    // unapproved account's read is a 42501 the store would have to explain.
+    // Not mounting the planner at all is why it never has to.
+    const read = vi.fn(adapterControl.read);
+    adapterControl.read = read;
+    mockedUseSession.mockReturnValue({
+      session: makeSession('user-1', 'alex@example.com'),
+      profile: makeProfile({ approved: false }),
+      loading: false,
+      signOut,
+    });
 
     render(<App />);
     await settle();
 
-    expect(screen.getByText(/People tab could not be read/i)).toBeInTheDocument();
-    expect(screen.getByText(/will not write over it/i)).toBeInTheDocument();
-    // Merged, not stacked (DESIGN.md §3): the stale message and its action
-    // ride along in the same banner.
-    expect(screen.getByText(/out of date/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /recalculate/i })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /waiting for approval/i })).toBeInTheDocument();
+    expect(read).not.toHaveBeenCalled();
+  });
+});
+
+describe('App: the Admin tab is the owner’s alone', () => {
+  it('is absent for an approved admin who does not own the account', async () => {
+    render(<App />);
+    await settle();
+
+    expect(screen.queryByRole('button', { name: /^admin$/i })).not.toBeInTheDocument();
+  });
+
+  it('is offered to the owner and opens the accounts page', async () => {
+    signedIn({ isOwner: true });
+    render(<App />);
+    await settle();
+
+    await openTab(/^admin$/i);
+    expect(screen.getByRole('heading', { name: /accounts/i })).toBeInTheDocument();
+  });
+});
+
+describe('App: a load the store refused is never silent', () => {
+  it('reports an unapproved account as an error, naming the approval', async () => {
+    // Reachable when approval is withdrawn between the gate's profile read
+    // and the store's: the gate lets the session through, the store's read
+    // comes back 42501.
+    const { StorageError, INSUFFICIENT_PRIVILEGE } = await import('../storage/modelAdapter');
+    adapterControl.read = () =>
+      Promise.reject(new StorageError('not approved', { code: INSUFFICIENT_PRIVILEGE }));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText(/not approved yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/ask the owner to approve it/i)).toBeInTheDocument();
+  });
+
+  it('says plainly that nothing will be saved when the load failed outright', async () => {
+    adapterControl.read = () => Promise.reject(new Error('the server is unreachable'));
+
+    render(<App />);
+    await settle();
+
+    expect(screen.getByText(/could not load your data/i)).toBeInTheDocument();
   });
 });
 
@@ -253,6 +449,11 @@ describe('ErrorBoundary', () => {
 // debounce, so the write the failing render was heading towards still
 // landed. And it sent the user to "the Setup tab" even when Setup was the
 // tab that had just failed.
+//
+// The promise matters more now, not less: the store's write replaces the
+// WHOLE account in one transaction, so a push aimed at a model the renderer
+// could not make sense of is not a bad save, it is the account's real state
+// gone.
 // ---------------------------------------------------------------------------
 
 describe('ErrorBoundary: the promise it makes is backed by what it does', () => {
@@ -289,131 +490,58 @@ describe('ErrorBoundary: the promise it makes is backed by what it does', () => 
 
 // ---------------------------------------------------------------------------
 // N6 regression: severity was decided by which slot a message landed in, not
-// by what the message said. A single skipped malformed row rendered as a
-// persistent red error banner, and a real "could not save to the backend"
-// failure was demoted to description text under it, losing its error
-// styling entirely.
+// by what the message said, so a real "could not save" failure could be
+// demoted to description text and lose its error styling entirely.
 // ---------------------------------------------------------------------------
 
-describe('planNoticeBanner: severity follows the message, not the slot', () => {
-  const clean = {
-    dataNotice: null,
-    hasUnreadableTab: false,
-    notice: null,
-    status: 'idle' as const,
-    staleReason: null,
-  };
-
+describe('planNoticeBanner: severity follows what went wrong', () => {
   it('has nothing to say when nothing is live', () => {
-    expect(planNoticeBanner(clean)).toBeNull();
+    expect(planNoticeBanner({ notice: null, status: 'idle', staleReason: null })).toBeNull();
   });
 
-  it('treats a skipped row as informational, not an error', () => {
+  it('keeps a failed save at error severity', () => {
     const plan = planNoticeBanner({
-      ...clean,
-      dataNotice: "Loaded with 1 problem(s) in the backend's data — see the console for detail.",
+      notice: 'Could not save to Supabase: offline.', status: 'error', staleReason: null,
+    });
+    expect(plan?.status).toBe('error');
+  });
+
+  it('treats a refused account as an error, not as a passing remark', () => {
+    const plan = planNoticeBanner({
+      notice: 'This account is not approved yet.', status: 'forbidden', staleReason: null,
+    });
+    expect(plan?.status).toBe('error');
+  });
+
+  it('stays informational while the store is healthy', () => {
+    const plan = planNoticeBanner({
+      notice: 'Could not recalculate: nothing to place.', status: 'idle', staleReason: null,
     });
     expect(plan?.status).toBe('info');
-    expect(plan?.title).toMatch(/1 problem/);
   });
 
-  it('treats a tab that could not be read at all as an error', () => {
+  it('does not swallow a live notice behind the stale message', () => {
     const plan = planNoticeBanner({
-      ...clean,
-      dataNotice: 'The People tab could not be read: …',
-      hasUnreadableTab: true,
-    });
-    expect(plan?.status).toBe('error');
-  });
-
-  it('keeps a save failure at error severity and in the lead, even beside a skipped row', () => {
-    const plan = planNoticeBanner({
-      ...clean,
-      dataNotice: "Loaded with 1 problem(s) in the backend's data — see the console for detail.",
-      notice: 'Could not save to the backend: quota exceeded. Your changes are kept locally.',
+      notice: 'Could not save to Supabase: offline.',
       status: 'error',
+      staleReason: 'The schedule changed since the last recalculation.',
     });
-    expect(plan?.status).toBe('error');
-    expect(plan?.title).toMatch(/could not save to the backend/i);
-    expect(plan?.description).toMatch(/1 problem/);
-  });
-
-  it('leaves an unreadable tab in the lead when both are errors', () => {
-    const plan = planNoticeBanner({
-      ...clean,
-      dataNotice: 'The People tab could not be read: …',
-      hasUnreadableTab: true,
-      notice: 'Could not save to the backend: quota exceeded. Your changes are kept locally.',
-      status: 'error',
-    });
-    expect(plan?.status).toBe('error');
-    expect(plan?.title).toMatch(/People tab could not be read/);
-    expect(plan?.description).toMatch(/could not save to the backend/i);
-  });
-
-  it('does not swallow a sync notice behind the stale message', () => {
-    const plan = planNoticeBanner({
-      ...clean,
-      notice: 'Could not reach the backend (network down). Showing your last saved copy.',
-      status: 'offline',
-      staleReason: 'The schedule changed since the last recalculation — results are out of date.',
-    });
-    expect(plan?.status).toBe('error');
-    expect(plan?.title).toMatch(/could not reach the backend/i);
-    expect(plan?.description).toMatch(/out of date/);
-  });
-});
-
-describe('App: a skipped row is an informational notice, not a red error', () => {
-  it('renders the row-level data notice without error styling', async () => {
-    // The tab's header is fine; one row carries an unparseable role, so it
-    // is skipped and reported. Nothing is being withheld from the backend.
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify({
-      People: [
-        ['id', 'name', 'role', 'managerId'],
-        ['p1', 'Alex', 'BOSS', ''],
-        ['p2', 'Sam', 'REPORT', ''],
-      ],
-    }));
-    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    render(<App />);
-    await settle();
-
-    const notice = screen.getByText(/1 problem\(s\) in the backend's data/i);
-    expect(notice).toBeInTheDocument();
-    // Astryx's Banner gives an error status the assertive `role="alert"` and
-    // an informational one the polite `role="status"`, so the ARIA role of
-    // the banner this message sits in IS its severity.
-    expect(notice.closest('[role="alert"]')).toBeNull();
-    expect(notice.closest('[role="status"]')).not.toBeNull();
-
-    consoleWarn.mockRestore();
+    // The notice leads and keeps its severity; the stale message trails.
+    expect(plan?.title).toMatch(/could not save/i);
+    expect(plan?.description).toMatch(/schedule changed/i);
   });
 });
 
 // ---------------------------------------------------------------------------
 // N3 regression: a model with people and an override but nothing allocated
-// has no month for `recalculate` to schedule over, so the recalculation
-// placed nothing every time and never recorded a hash. The banner stayed up
-// for the whole session, its one primary action failed on every press, and
-// nothing was written to make it stop — while the Weeks page rendered a full
-// schedule on screen. An empty scheduling window is an empty state.
+// can only ever schedule nothing, so the stale banner nagged permanently and
+// its one action failed on every press. That is an EMPTY STATE, named where
+// it can be acted on, not staleness.
 // ---------------------------------------------------------------------------
-
-/** People and an override, and not one allocated month. */
-const NOTHING_ALLOCATED = {
-  OTLs: [
-    ['projectCode', 'taskCode', 'expenditureTypeCode', 'timeReportingCode', 'category', 'leaveSubtype', 'isDefaultOpex', 'colorIndex', 'active'],
-    ['OPEX-ADMIN', 'T0', 'E0', 'R0', 'OPEX', '', 'TRUE', '1', 'TRUE'],
-  ],
-  People: [['id', 'name', 'role', 'managerId'], ['p1', 'Alex', 'MANAGER', '']],
-  Overrides: [['personId', 'date', 'otlProjectCode', 'hours'], ['p1', '2026-09-07', 'OPEX-ADMIN', '7.5']],
-};
 
 describe('App: no allocated month is an empty state, not a permanent nag', () => {
   it('offers no stale banner and no Recalculate action when there is no month to schedule over', async () => {
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(NOTHING_ALLOCATED));
+    adapterControl.read = () => Promise.resolve(storedState(NOTHING_ALLOCATED));
 
     render(<App />);
     await settle();
@@ -423,7 +551,7 @@ describe('App: no allocated month is an empty state, not a permanent nag', () =>
   });
 
   it('names the missing allocation on the Allocations tab instead', async () => {
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(NOTHING_ALLOCATED));
+    adapterControl.read = () => Promise.resolve(storedState(NOTHING_ALLOCATED));
 
     render(<App />);
     await settle();
@@ -433,12 +561,9 @@ describe('App: no allocated month is an empty state, not a permanent nag', () =>
   });
 
   it('still offers Recalculate once a month has an allocation', async () => {
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify({
+    adapterControl.read = () => Promise.resolve(storedState({
       ...NOTHING_ALLOCATED,
-      Allocations: [
-        ['month', 'otlProjectCode', 'personId', 'hours'],
-        ['2026-09', 'OPEX-ADMIN', 'p1', '40'],
-      ],
+      allocations: [{ month: '2026-09', otlProjectCode: 'OPEX-ADMIN', personId: 'p1', hours: 40 }],
     }));
 
     render(<App />);
@@ -452,27 +577,23 @@ describe('App: no allocated month is an empty state, not a permanent nag', () =>
 // N4 regression: `needsAllocation` is the right empty state for a model that
 // was NEVER scheduled. For one that WAS scheduled and then had its
 // allocations removed it over-suppressed BOTH the banner and the action —
-// while the backend still held the schedule rows and `Meta` still certified
-// the old hash, and WeeksPage recomputed from the current model. The screen
-// and the sheet disagreed, with nothing saying so. Silent staleness is this
-// project's named recurring failure mode.
+// while the account still held the schedule rows and the stored hash still
+// certified the old model, and WeeksPage recomputed from the current one.
+// The screen and the stored data disagreed, with nothing saying so. Silent
+// staleness is this project's named recurring failure mode.
 // ---------------------------------------------------------------------------
 
-/** The same model, but a schedule WAS calculated for it once: `Meta`
- *  certifies a hash, and the `Schedule` tab holds the rows it certifies.
- *  Then the allocations went away. */
-const CERTIFIED_THEN_UNALLOCATED = {
-  ...NOTHING_ALLOCATED,
-  Schedule: [
-    ['personId', 'date', 'otlProjectCode', 'blocks', 'source', 'overrideBlocks'],
-    ['p1', '2026-09-07', 'OPEX-ADMIN', '2', 'OVERRIDE', '2'],
-  ],
-  Meta: [['key', 'value'], ['modelHash', 'the-hash-it-was-scheduled-against']],
-};
-
 describe('App: a certified schedule that lost its allocations still says so', () => {
+  /** The same model, but a schedule WAS calculated for it once: a hash is
+   *  stored, and the schedule rows it certifies came back with it. Then the
+   *  allocations went away. */
+  const certifiedThenUnallocated = () =>
+    Promise.resolve(storedState(
+      NOTHING_ALLOCATED, [A_SCHEDULE_ENTRY], 'the-hash-it-was-scheduled-against',
+    ));
+
   it('keeps a banner up naming the missing allocation, without offering Recalculate', async () => {
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(CERTIFIED_THEN_UNALLOCATED));
+    adapterControl.read = certifiedThenUnallocated;
 
     render(<App />);
     await settle();
@@ -483,7 +604,7 @@ describe('App: a certified schedule that lost its allocations still says so', ()
   });
 
   it('names the allocation that is missing, so the banner is actionable', async () => {
-    localStorage.setItem(LOCAL_ADAPTER_KEY, JSON.stringify(CERTIFIED_THEN_UNALLOCATED));
+    adapterControl.read = certifiedThenUnallocated;
 
     render(<App />);
     await settle();

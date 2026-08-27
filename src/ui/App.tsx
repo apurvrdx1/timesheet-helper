@@ -1,7 +1,16 @@
 /**
- * The application shell: theme root, page header, primary navigation, the
- * recalculation banner, and the per-tab content area. Each tab renders its
- * real page — SetupPage, AllocationsPage, WeeksPage — wired to `useStore()`.
+ * The application shell: theme root, the auth gate, page header, primary
+ * navigation, the recalculation banner, and the per-tab content area. Each tab
+ * renders its real page — SetupPage, AllocationsPage, WeeksPage, AdminPage —
+ * wired to `useStore()`.
+ *
+ * `AuthGate` sits INSIDE `Theme` and OUTSIDE everything else, for two
+ * reasons. The signed-out screens (`SignInPage`, `PendingApproval`) render
+ * Astryx components and need the theme scope on `document.documentElement`
+ * just as much as the planner does. And `useStore()` reads the whole account
+ * on mount, so it must not run for a visitor who has no session or no
+ * approval — hence the planner is a separate component that only mounts once
+ * the gate has let someone through.
  */
 import { Component, useCallback, useState } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
@@ -11,22 +20,25 @@ import { Section } from '@astryxdesign/core/Section';
 import { Layout, LayoutContent, LayoutHeader } from '@astryxdesign/core/Layout';
 import { HStack } from '@astryxdesign/core/HStack';
 import { Heading } from '@astryxdesign/core/Heading';
+import { Text } from '@astryxdesign/core/Text';
 import { Button } from '@astryxdesign/core/Button';
 import { Banner } from '@astryxdesign/core/Banner';
 import { TabList, Tab } from '@astryxdesign/core/TabList';
 import { StaleBanner } from './components/StaleBanner';
-import { ConnectionSettings } from './components/ConnectionSettings';
 import { SetupPage } from './pages/SetupPage';
 import { AllocationsPage } from './pages/AllocationsPage';
 import { WeeksPage } from './pages/WeeksPage';
+import { AdminPage } from './pages/AdminPage';
+import { AuthGate } from '../auth/AuthGate';
+import { useSession } from '../auth/useSession';
 import { useStore } from '../storage/store';
 import type { StoreStatus } from '../storage/store';
 import type { IsoMonth, Model } from '../domain/types';
 
-type TabValue = 'setup' | 'allocations' | 'weeks';
+type TabValue = 'setup' | 'allocations' | 'weeks' | 'admin';
 
 function isTabValue(value: string): value is TabValue {
-  return value === 'setup' || value === 'allocations' || value === 'weeks';
+  return value === 'setup' || value === 'allocations' || value === 'weeks' || value === 'admin';
 }
 
 const TABS: ReadonlyArray<{ value: TabValue; label: string }> = [
@@ -54,11 +66,11 @@ const STALE_REASON = 'The schedule changed since the last recalculation — resu
  * A model that was never scheduled and has nothing allocated is an empty
  * state, and `needsAllocation` rightly keeps the nag off it. A model that WAS
  * scheduled and then had its allocations removed is a different thing: the
- * backend still holds the schedule rows, `Meta` still certifies the old hash,
- * and the Weeks page recomputes from the current model — so the sheet and the
- * screen disagree. Suppressing both the banner and the action there was
- * silent staleness. The banner stays; the action, which still cannot succeed,
- * does not. */
+ * account still holds the schedule rows, the stored hash still certifies them,
+ * and the Weeks page recomputes from the current model — so the stored data
+ * and the screen disagree. Suppressing both the banner and the action there
+ * was silent staleness. The banner stays; the action, which still cannot
+ * succeed, does not. */
 const UNCLEARABLE_STALE_REASON =
   'The stored schedule no longer matches the model, and it cannot be rebuilt: the model has ' +
   'no allocated months to place hours into. Add an allocation on the Allocations tab for the ' +
@@ -84,23 +96,21 @@ const RECOVERY_HINT_HERE =
 /**
  * Which message leads the one banner, and how loudly it speaks.
  *
- * Two messages can be live at once — a data-integrity notice about the last
- * read, and a sync notice about the last write — and DESIGN.md §3 allows
- * exactly one banner, so they merge. The severity is what went wrong, and it
- * used to be decided by which slot a message landed in rather than by what it
- * said:
+ * DESIGN.md §3 allows exactly one banner, and two things can want it at once:
+ * the store's notice about the last load or save, and the stale message about
+ * the schedule. They merge rather than stacking, and the severity comes from
+ * WHAT WENT WRONG rather than from which slot the message landed in:
  *
- * - A single skipped malformed row is informational: the rest of the sheet
- *   loaded, nothing is being withheld, and there is nothing to do right now.
- *   It rendered as a persistent red error.
- * - A tab that could not be read at all IS an error: data in the spreadsheet
- *   the app cannot see, and the user's edits to it are going nowhere.
- * - "Could not save to the backend" is an error whenever `status` says so,
- *   and it used to be demoted to description text under an informational
- *   data notice, losing its error styling entirely.
+ * - A failed save, a failed load and a refused one (`status` `'error'` or
+ *   `'forbidden'`) are errors: the user's data is not where they think it is.
+ *   These used to be demoted to description text under an informational
+ *   notice, losing their error styling entirely.
+ * - Anything the store says while it is otherwise healthy is informational.
  *
- * So severity is assigned per message, error-severity messages lead, and the
- * banner takes the severity of whichever message leads.
+ * The stale message always trails, never leads: it is a statement about the
+ * schedule and it carries its own action (the Recalculate button), so putting
+ * it in front of "your changes are not being saved" would bury the one thing
+ * the user has to act on.
  */
 export interface NoticeBannerPlan {
   status: 'error' | 'info';
@@ -109,41 +119,21 @@ export interface NoticeBannerPlan {
 }
 
 interface NoticeBannerInput {
-  dataNotice: string | null;
-  /** True when the data notice is about a tab that could not be read at all,
-   *  rather than rows that were skipped. */
-  hasUnreadableTab: boolean;
   notice: string | null;
   status: StoreStatus;
-  /** The stale message, when the schedule is out of date. Always trails: it
-   *  is a statement about the schedule, and it carries its own action. */
+  /** The stale message, when the schedule is out of date. */
   staleReason: string | null;
 }
 
 export function planNoticeBanner({
-  dataNotice, hasUnreadableTab, notice, status, staleReason,
+  notice, status, staleReason,
 }: NoticeBannerInput): NoticeBannerPlan | null {
-  const messages: Array<{ severity: 'error' | 'info'; text: string }> = [];
-  if (dataNotice !== null && dataNotice !== '') {
-    messages.push({ severity: hasUnreadableTab ? 'error' : 'info', text: dataNotice });
-  }
-  if (notice !== null && notice !== '') {
-    const isSyncFailure = status === 'error' || status === 'offline';
-    messages.push({ severity: isSyncFailure ? 'error' : 'info', text: notice });
-  }
-  if (messages.length === 0) return null;
-
-  const errors = messages.filter((message) => message.severity === 'error');
-  const ordered = [...errors, ...messages.filter((message) => message.severity !== 'error')];
-  const lead = ordered[0];
-  if (lead === undefined) return null;
-
+  if (notice === null || notice === '') return null;
+  const isFailure = status === 'error' || status === 'forbidden';
   return {
-    status: lead.severity,
-    title: lead.text,
-    description: [...ordered.slice(1).map((message) => message.text), staleReason]
-      .filter((text): text is string => text !== null && text !== '')
-      .join(' '),
+    status: isFailure ? 'error' : 'info',
+    title: notice,
+    description: staleReason ?? '',
   };
 }
 
@@ -171,8 +161,8 @@ interface ErrorBoundaryState {
  * model itself tolerates.
  *
  * Renders the constraint the domain named plus the action that clears it,
- * never a stack trace, and keeps the header, tabs and connection settings
- * alive around it so the user can go and fix the cause.
+ * never a stack trace, and keeps the header and tabs alive around it so the
+ * user can go and fix the cause.
  */
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   override state: ErrorBoundaryState = { message: null };
@@ -184,7 +174,9 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   override componentDidCatch(error: unknown, info: ErrorInfo): void {
     // Before anything else: make "nothing was saved over" true. A push may
     // already be sitting on the store's 2s debounce, aimed at the very
-    // model the failing render could not make sense of.
+    // model the failing render could not make sense of — and the store's
+    // write replaces the WHOLE account, so letting it leave is not a partial
+    // save, it is the account's real state replaced by a broken one.
     this.props.onError?.();
     // The screen gets the constraint; the console gets the detail needed to
     // debug it. Same split the store uses for load problems.
@@ -212,27 +204,25 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 }
 
-export function App() {
+/**
+ * Everything behind the gate. Mounted only for a signed-in, approved account,
+ * which is what makes `useStore()`'s mount read legitimate.
+ */
+export function Planner() {
   const {
-    model, isStale, needsAllocation, hasCertifiedSchedule, status, notice, dataNotice,
-    unreadableTabs, update, cancelPendingPush, recalculate, config, connect,
+    model, isStale, needsAllocation, hasCertifiedSchedule, status, notice,
+    update, cancelPendingPush, recalculate,
   } = useStore();
+  // A second `useSession()` — `AuthGate` has its own, and AdminPage already
+  // does the same. The alternative is threading the session through the gate
+  // as a render prop, which would make every consumer of `AuthGate` carry it.
+  const { profile, signOut } = useSession();
+  const isOwner = profile?.isOwner === true;
+
   const [activeTab, setActiveTab] = useState<TabValue>('setup');
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  // ConnectionSettings is a controlled form: it reports edits via `onChange`
-  // and only asks the store to actually connect (write to the backend) once
-  // the user presses Connect (`onConnect`). This local draft holds the
-  // in-progress edit, seeded from the store's committed config each time the
-  // dialog opens, so cancelling never touches the real connection.
-  const [draftConfig, setDraftConfig] = useState(config);
   // Held here, not per-page, so switching tabs (Allocations ↔ Weeks) keeps
   // the manager's place instead of resetting to the current month.
   const [month, setMonth] = useState<IsoMonth>(() => currentMonth());
-
-  const openConnectionSettings = (): void => {
-    setDraftConfig(config);
-    setIsSettingsOpen(true);
-  };
 
   // AllocationsPage/WeeksPage take `update` as "apply this whole next
   // model" — the store's `update` takes an updater function instead, so
@@ -254,102 +244,95 @@ export function App() {
       ? UNCLEARABLE_STALE_REASON
       : null;
 
-  const bannerPlan = planNoticeBanner({
-    dataNotice,
-    hasUnreadableTab: unreadableTabs.length > 0,
-    notice,
-    status,
-    staleReason,
-  });
+  const bannerPlan = planNoticeBanner({ notice, status, staleReason });
 
   return (
-    <Theme theme={neutralTheme}>
-      <Section variant="section" maxWidth={1440} padding={8}>
-        <Layout
-          header={
-            <LayoutHeader hasDivider role="banner">
-              <HStack hAlign="between" vAlign="center">
-                <Heading level={1}>Timesheet helper</Heading>
-                <Button
-                  label="Connection settings"
-                  variant="secondary"
-                  onClick={openConnectionSettings}
-                />
+    <Section variant="section" maxWidth={1440} padding={8}>
+      <Layout
+        header={
+          <LayoutHeader hasDivider role="banner">
+            <HStack hAlign="between" vAlign="center">
+              <Heading level={1}>Timesheet helper</Heading>
+              <HStack gap={3} vAlign="center">
+                {profile !== null && <Text type="supporting">{profile.email}</Text>}
+                <Button label="Sign out" variant="secondary" clickAction={() => signOut()} />
               </HStack>
-            </LayoutHeader>
-          }
-          content={
-            <LayoutContent>
-              {/* One banner at a time (DESIGN.md §3) — merged, never stacked.
-                  `planNoticeBanner` decides which live message leads and how
-                  loudly the banner speaks; the Recalculate action stays
-                  attached whenever the schedule is stale, so a data or sync
-                  message never costs the user the primary action. With no
-                  message live at all, the stale banner stands on its own.
-                  Suppressing a data-integrity problem behind the stale banner
-                  (which is up on exactly that load, because Meta's hash was
-                  written against the intact model) is how the user used to
-                  never hear about it at all. */}
-              {bannerPlan !== null ? (
-                <Banner
-                  status={bannerPlan.status}
-                  title={bannerPlan.title}
-                  description={bannerPlan.description}
-                  collapsible={false}
-                  endContent={
-                    canRecalculate ? (
-                      <Button label="Recalculate" variant="primary" onClick={recalculate} />
-                    ) : undefined
-                  }
-                />
-              ) : (
-                <StaleBanner
-                  isStale={staleReason !== null}
-                  reason={staleReason ?? STALE_REASON}
-                  onRecalculate={canRecalculate ? recalculate : undefined}
-                />
+            </HStack>
+          </LayoutHeader>
+        }
+        content={
+          <LayoutContent>
+            {/* One banner at a time (DESIGN.md §3) — merged, never stacked.
+                `planNoticeBanner` decides how loudly the banner speaks; the
+                Recalculate action stays attached whenever the schedule is
+                stale, so a load or save message never costs the user the
+                primary action. With no message live at all, the stale banner
+                stands on its own. */}
+            {bannerPlan !== null ? (
+              <Banner
+                status={bannerPlan.status}
+                title={bannerPlan.title}
+                description={bannerPlan.description}
+                collapsible={false}
+                endContent={
+                  canRecalculate ? (
+                    <Button label="Recalculate" variant="primary" onClick={recalculate} />
+                  ) : undefined
+                }
+              />
+            ) : (
+              <StaleBanner
+                isStale={staleReason !== null}
+                reason={staleReason ?? STALE_REASON}
+                onRecalculate={canRecalculate ? recalculate : undefined}
+              />
+            )}
+            <TabList
+              value={activeTab}
+              onChange={(value) => {
+                if (isTabValue(value)) setActiveTab(value);
+              }}
+            >
+              {TABS.map((tab) => (
+                <Tab key={tab.value} value={tab.value} label={tab.label} />
+              ))}
+              {/* Owner-only. The database agrees independently — every row
+                  AdminPage reads and writes is behind `profiles_owner_reads_all`
+                  and `profiles_owner_updates` — so hiding the tab is the UI
+                  matching the schema, not the only guard. */}
+              {isOwner && <Tab value="admin" label="Admin" />}
+            </TabList>
+            {/* Keyed by tab so moving to another tab clears a caught error
+                and remounts that page: the way out of a domain constraint
+                is almost always Setup, and the boundary must not stand
+                between the user and it. */}
+            <ErrorBoundary
+              key={activeTab}
+              isRecoveryPage={activeTab === 'setup'}
+              onError={cancelPendingPush}
+            >
+              {activeTab === 'setup' && <SetupPage model={model} update={update} />}
+              {activeTab === 'allocations' && (
+                <AllocationsPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
               )}
-              <TabList
-                value={activeTab}
-                onChange={(value) => {
-                  if (isTabValue(value)) setActiveTab(value);
-                }}
-              >
-                {TABS.map((tab) => (
-                  <Tab key={tab.value} value={tab.value} label={tab.label} />
-                ))}
-              </TabList>
-              {/* Keyed by tab so moving to another tab clears a caught error
-                  and remounts that page: the way out of a domain constraint
-                  is almost always Setup, and the boundary must not stand
-                  between the user and it. */}
-              <ErrorBoundary
-                key={activeTab}
-                isRecoveryPage={activeTab === 'setup'}
-                onError={cancelPendingPush}
-              >
-                {activeTab === 'setup' && <SetupPage model={model} update={update} />}
-                {activeTab === 'allocations' && (
-                  <AllocationsPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
-                )}
-                {activeTab === 'weeks' && (
-                  <WeeksPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
-                )}
-              </ErrorBoundary>
-            </LayoutContent>
-          }
-        />
-      </Section>
-      <ConnectionSettings
-        config={draftConfig}
-        onChange={setDraftConfig}
-        onConnect={() => {
-          void connect(draftConfig);
-          setIsSettingsOpen(false);
-        }}
-        isOpen={isSettingsOpen}
-        onOpenChange={setIsSettingsOpen}
+              {activeTab === 'weeks' && (
+                <WeeksPage model={model} month={month} update={applyModel} onMonthChange={setMonth} />
+              )}
+              {activeTab === 'admin' && isOwner && <AdminPage />}
+            </ErrorBoundary>
+          </LayoutContent>
+        }
       />
+    </Section>
+  );
+}
+
+export function App() {
+  return (
+    <Theme theme={neutralTheme}>
+      <AuthGate>
+        <Planner />
+      </AuthGate>
     </Theme>
   );
 }
