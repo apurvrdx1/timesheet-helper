@@ -50,9 +50,14 @@ migration.
 
 **The service-role (secret) key must never be used by this app and must never be committed,
 in this file or anywhere else.** It bypasses RLS entirely — anything holding it can read or
-write every owner's data. Schema changes that require it (like this migration) are applied
-by a human, from the dashboard or an authenticated `supabase` CLI session, never from
-application code or CI secrets.
+write every owner's data. Schema changes that require it (like the migrations above) are
+applied by a human, from the dashboard or an authenticated `supabase` CLI session, never
+from application code.
+
+There is exactly one exception, and it is not the app: the row-level-security integration
+suite needs the service-role key to build and tear down its fixtures. See
+[Running the isolation suite](#running-the-isolation-suite) for what it does with it and
+why nothing else can. Nothing that ships to a browser ever sees that key.
 
 ## `on delete cascade`
 
@@ -174,6 +179,20 @@ they may become. With `using` alone, an admin could `update ... set owner_id = <
 else>` and move a row into another account. The policies are written out per table rather
 than generated in a loop, so any one table's guarantee is readable in isolation.
 
+**Do not delete a `with check` clause because the tests stay green without it.** Two
+things hide it. First, an UPDATE policy with no `with check` at all is not weaker: Postgres
+falls back to the `using` expression, so dropping the clause changes nothing. Second — and
+this is the trap — relaxing it to something permissive is *also* invisible through
+PostgREST today, because Postgres additionally applies the SELECT policy to the row an
+UPDATE produces whenever the statement carries a RETURNING clause, and PostgREST always
+emits one. `otls_select` and `otls_update`'s `with check` are the same expression, so the
+select policy silently covers for a broken update policy. Verified against the live
+project: with `otls_update ... with check (true)` the whole isolation suite still passed;
+relaxing `otls_select` to `using (true)` as well, and the row moved to the other account.
+The `with check` is what guards the plain-SQL path, which has no RETURNING, and it is the
+only thing that would still hold if `otls_select` were ever broadened (a shared or
+team-wide read policy, say). It is load-bearing precisely where nothing is watching.
+
 `profiles` is deliberately different — three policies, not four:
 
 - `profiles_self_read` — anyone reads their own row. Note there is **no** `is_approved()`
@@ -194,6 +213,82 @@ Note: Supabase ships an `ensure_rls` event trigger (`rls_auto_enable`) that runs
 already on for all nine tables before this migration — with no policies, which is
 default-deny. `0003_rls.sql` re-asserts `enable row level security` anyway, so the guarantee
 is legible from that one file and does not depend on a platform trigger continuing to exist.
+
+## Running the isolation suite
+
+`src/storage/rls.integration.test.ts` is the automated proof that the policies above
+actually isolate one admin from another. It runs against the **real** project — nothing in
+it is mocked, because a mock of the database would be a mock of the thing that enforces
+isolation, and it would pass just as happily with every policy dropped.
+
+```bash
+npm run test:integration
+```
+
+It is deliberately **not** part of `npm test`. It needs network and credentials, and a
+developer who has neither should not be looking at red. `vitest.config.ts` excludes
+`*.integration.test.ts`; `vitest.integration.config.ts` is the only thing that runs it
+(node environment, not jsdom, and a 60s timeout for real round trips).
+
+### Environment variables
+
+| Variable | Where it comes from | What the suite does with it |
+|---|---|---|
+| `SUPABASE_URL` *(or `VITE_SUPABASE_URL`)* | Project URL, above | Connects |
+| `SUPABASE_ANON_KEY` *(or `VITE_SUPABASE_ANON_KEY`)* | Publishable key | **Every assertion.** Each test account is a real session on this key — the exact path the shipped app takes |
+| `SUPABASE_SERVICE_ROLE_KEY` | Project Settings → API → service_role | Fixture setup and teardown only. Never used in an assertion |
+
+The first two are already in `.env.local` for `npm run dev`, and the suite reads that file,
+so in practice only the third has to be supplied. Real environment variables win over
+`.env.local`, which is what lets CI inject all three as secrets.
+
+Locally, keep the service-role key out of files entirely by passing it for one command:
+
+```bash
+SUPABASE_SERVICE_ROLE_KEY="$(npx supabase projects api-keys \
+  --project-ref qhgvkgayadeicnrnuiuu | jq -r '.keys[]|select(.name=="service_role")|.api_key')" \
+  npm run test:integration
+```
+
+In CI it must be a repository secret. It must never be committed, never printed to a log,
+and never added to any `VITE_`-prefixed variable — Vite inlines those into the built
+bundle, which would publish it.
+
+### Why the service-role key, and why it cannot be avoided
+
+The suite needs two accounts that are **approved**, and approval is by design impossible
+for the publishable key to grant: `profiles_owner_updates` reserves it to the single owner
+account. A throwaway run cannot create an owner either — `one_owner_only` permits exactly
+one across the whole project, so a suite that minted one could not run twice concurrently,
+and a permanent owner would be shared mutable state between runs.
+
+Teardown settles it independently. A run must leave nothing behind, and deleting an
+`auth.users` row (which cascades through `profiles` and all eight domain tables) is not
+something any client-side key can do. Both jobs need admin access, so the suite uses the
+narrowest credential that has it: the project's service-role key, in `beforeAll` and
+`afterAll` only. Every isolation claim is made through the publishable key.
+
+### What a run does to the project
+
+Creates four users (`rls-<run-id>-{alice,bob,pending,revoked}@example.test`), approves
+three of them, writes a handful of rows stamped with a per-run id, and deletes all four
+users at the end — then verifies no profile or domain row survived, failing loudly if one
+did. Every identifier is unique per run, so two runs at once cannot collide. A completed
+run leaves the project exactly as it found it:
+
+```sql
+select (select count(*) from auth.users) as users,
+       (select count(*) from profiles) as profiles,
+       (select count(*) from profiles where is_owner) as owners,
+       (select count(*) from otls) as otls;
+-- all zero on an otherwise-empty project
+```
+
+If the suite is interrupted, teardown may not run. Sweep leftovers with:
+
+```sql
+delete from auth.users where email like 'rls-%@example.test';
+```
 
 ## Bootstrapping the owner account
 

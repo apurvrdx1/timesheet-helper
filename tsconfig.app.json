@@ -24,5 +24,10 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // The isolation suite is Node code that lives under src/ because that is
+  // where the storage layer it guards lives. It needs Node's globals
+  // (process.env, node:crypto), which app code must not have — so it is
+  // type-checked by tsconfig.node.json instead.
+  "exclude": ["src/**/*.integration.test.ts"]
 }
