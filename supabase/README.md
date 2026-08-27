@@ -261,7 +261,71 @@ statement. Verified against the live project:
 `src/storage/supabase.ts` never uses `select('*')` — a star select returns the generated
 column, and a naive round trip would try to write it back.
 
-`execute` is granted to `authenticated` and revoked from `public`.
+`execute` is granted to `authenticated` and revoked from `public`. **That revoke did not do
+what 0005's comment says it did** — see `0006_lock_down_replace_state.sql` below, which is
+the file that actually takes the grant away from `anon`.
+
+## `migrations/0006_lock_down_replace_state.sql`
+
+Three corrections to 0005, all measured against the live project before being written.
+
+**`anon` could execute `replace_state`, and 0005's comment said it could not.** Supabase's
+`alter default privileges in schema public grant all on functions to anon, authenticated,
+service_role` means `create function` produced an *explicit* grant to the named role `anon`.
+`revoke ... from public` removes the `PUBLIC` pseudo-role's grant and leaves an explicit
+named-role grant exactly where it was. Measured on the deployed function:
+
+```
+replace_state(state jsonb) proacl:
+  postgres=X/postgres | anon=X/postgres | authenticated=X/postgres | service_role=X/postgres
+```
+
+and reproduced from outside with the publishable key and no session, using a control call
+so that "refused" can be told apart from "does not exist":
+
+```
+rpc(definitely_not_a_function_xyz)  -> PGRST202   (this is what unreachable looks like)
+rpc(replace_state, {not_the_param}) -> PGRST202   (wrong signature, same code)
+rpc(replace_state, {state: {...}})  -> 42501 new row violates row-level security
+                                       policy for table "otls"
+```
+
+`42501` is not `PGRST202`: the function **ran**, as `anon`, through all seven DELETEs
+(matching nothing, since `auth.uid()` is NULL) and was stopped only by `otls_insert`'s
+`with check`. Never exploitable for data — `owner_id` is `not null` and would have been
+NULL — but the defence-in-depth layer 0005 claimed did not exist, on the only write path in
+the system. 0006 revokes execute from `anon` by name.
+
+The other four functions this repo creates (`is_approved`, `is_account_owner`,
+`handle_new_user`, `handle_user_email_confirmed`) are anon-executable for the same reason
+and are left that way on purpose: the first two are the expressions the policies already
+evaluate on anon's behalf and return `false`, and the last two are trigger functions that
+error outside a trigger context. 0006 does **not** change `alter default privileges`
+project-wide; that would affect every future function in `public`, including ones no
+migration here owns.
+
+**`hours` was `numeric(8,2)`, and the domain never rounds.** `AllocationGrid.tsx` says so in
+its file header and nothing validates precision anywhere on the entry path. Measured through
+the exact coercion `replace_state` uses:
+
+| sent by the app | `numeric(8,2)` | plain `numeric` |
+|---|---|---|
+| `1.005` | `1.01` | `1.005` |
+| `12.3456` | `12.35` | `12.3456` |
+| `0.30000000000000004` | `0.30` | `0.30000000000000004` |
+
+So write-then-read was not an identity, `hashModel` came back different from what was
+stored (`9b5a66b7` vs `c79fdbd5` for that first row), and the staleness banner would return
+after a reload the user did nothing to cause — v1's permanent-nag bug, which A1 exists to
+prevent. Both `hours` columns are now unconstrained `numeric`, which stores the exact
+decimal it is given. A wider *fixed* scale was rejected because any fixed scale still rounds
+something, and `0.30000000000000004` is just what `0.1 + 0.2` serialises to.
+
+**`replace_state(null)` was a one-call self-wipe.** `coalesce(state->'x', '[]'::jsonb)` is
+right for a missing key, but for a SQL-NULL `state` every collection coalesced to `[]`, the
+seven DELETEs ran, and the account emptied. Only ever the caller's own account, and the
+adapter never did it. Guarded now with a `raise exception` at the top of the function.
+
 
 ## Running the isolation suite
 

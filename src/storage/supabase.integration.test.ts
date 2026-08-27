@@ -27,6 +27,7 @@ import { randomUUID } from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createSupabaseAdapter } from './supabase';
+import { INSUFFICIENT_PRIVILEGE, StorageError } from './modelAdapter';
 import type { StorageAdapter, StoredState } from './modelAdapter';
 
 // ---------------------------------------------------------------------------
@@ -484,7 +485,16 @@ describe('the Supabase storage adapter', () => {
     // Registration is open, so the approval gate is the whole security model
     // for a stranger who signs up. A new RPC that ignored it would be a way
     // around every policy in 0003_rls.sql.
-    await expect(pending.storage.read()).resolves.toEqual(EMPTY_STATE);
+    // NOT `resolves.toEqual(EMPTY_STATE)`, which is what this asserted before
+    // the Task 8 fix wave. RLS refuses a select silently — no rows, no error —
+    // so an unapproved account's read is byte-identical to a brand-new
+    // approved account's. Handing that back as an empty state is the top of a
+    // data-loss path: blank grid, one keystroke, debounced whole-account
+    // write, everything gone. The adapter now decides approval from
+    // `profiles` (via `is_approved()`) and raises instead.
+    const denied = await pending.storage.read().catch((e: unknown) => e);
+    expect(denied).toBeInstanceOf(StorageError);
+    expect((denied as StorageError).code).toBe(INSUFFICIENT_PRIVILEGE);
 
     await expect(pending.storage.write(fullState('nope'))).rejects.toThrow(
       /new row violates row-level security policy/,
@@ -509,12 +519,49 @@ describe('the Supabase storage adapter', () => {
     await alice.storage.write(state);
 
     await setApproval(alice.userId, false);
-    await expect(alice.storage.read()).resolves.toEqual(EMPTY_STATE);
+    // Raises rather than resolving empty — see the unapproved case above. The
+    // rows are still there; it is the reader who is no longer allowed to see
+    // them, and the two facts must not look the same to the app.
+    const revoked = await alice.storage.read().catch((e: unknown) => e);
+    expect(revoked).toBeInstanceOf(StorageError);
+    expect((revoked as StorageError).code).toBe(INSUFFICIENT_PRIVILEGE);
     await expect(alice.storage.write(fullState('after-revocation'))).rejects.toThrow(
       /new row violates row-level security policy/,
     );
 
     await setApproval(alice.userId, true);
     await expect(alice.storage.read()).resolves.toEqual(state);
+  });
+
+  it('does not offer replace_state to anon at all', async () => {
+    // 0005 claimed this and did not do it: `revoke ... from public` does not
+    // remove Supabase's explicit default-privileges grant to the named role
+    // `anon`, so an unauthenticated caller really could execute the function
+    // and get all seven DELETEs planned before RLS stopped the first insert.
+    // `0006_lock_down_replace_state.sql` revokes it by name.
+    //
+    // The control call is load-bearing: without it, PGRST202 could just mean
+    // "you spelled it wrong". The control proves what unreachable looks like,
+    // and then the same code on the real signature means the same thing.
+    const bare = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+
+    const control = await bare.rpc('definitely_not_a_function_xyz');
+    expect(control.error?.code, 'control: a function that does not exist').toBe('PGRST202');
+
+    const attempt = await bare.rpc('replace_state', {
+      state: {
+        otls: [{
+          project_code: 'ANON-PROBE', task_code: '', expenditure_type_code: '',
+          time_reporting_code: '', category: 'CAPEX', leave_subtype: null,
+          is_default_opex: false, color_index: 0, active: true,
+        }],
+      },
+    });
+    // Specifically NOT 42501. 42501 would mean the body ran and RLS caught it,
+    // which is what the deployed 0005 did.
+    expect(attempt.error?.code, 'anon calling replace_state').toBe('PGRST202');
+    expect(attempt.error?.code).not.toBe('42501');
   });
 });
