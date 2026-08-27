@@ -71,6 +71,24 @@ one-time setup step and must be documented in the README.
 There is no in-app path to create an owner. That is intentional: an app that can mint its
 own owner can be tricked into minting someone else's.
 
+### 4.4 Revocation
+
+The owner can revoke an approved account, which sets `approved = false`. Because every RLS
+policy tests that flag, revocation takes effect on the account's next query — there is no
+session to invalidate separately and no window where a revoked account still has access.
+
+**Revocation does not delete data.** The account's rows remain, owned by them and reachable
+by nobody, and re-approving restores access exactly as it was. Deleting a person's work
+because their access was suspended would be a destructive act triggered by an
+administrative one, and those should never be the same button.
+
+Permanently removing an account and its data is a deliberate, separate action, performed in
+the Supabase dashboard rather than in the app. There is no in-app path that destroys
+another account's data.
+
+The owner cannot revoke themselves — the app would become unadministrable, and recovering
+would mean editing the database by hand.
+
 ## 5. Isolation
 
 Every domain table carries `owner_id uuid not null references auth.users(id)`, defaulting
