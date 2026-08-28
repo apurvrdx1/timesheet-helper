@@ -241,6 +241,36 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
     adapterRef.current = adapter ?? createSupabaseAdapter(supabase);
   }
 
+  /**
+   * The state on screen.
+   *
+   * ## Who is allowed to change it (review finding F9)
+   *
+   * AFTER `loadInitial` HAS RESOLVED, `model` IS MUTATED BY EXACTLY TWO
+   * THINGS: `loadInitial` ITSELF, ONCE, AND `update`.
+   *
+   * That is not a description, it is a precondition, and something else in
+   * this file already depends on it. When a write comes back `42501` the
+   * store deliberately leaves the load epoch alone and leaves
+   * `isSafeToWrite` true, so that re-approval saves the user's edits instead
+   * of stranding them (see the catch in `pushToAdapter`). That is only sound
+   * because the state still on screen is provably "what the read returned,
+   * plus this user's own edits on top" — which is exactly what the two
+   * mutators above guarantee and nothing else does.
+   *
+   * So a THIRD mutator does not merely add a code path. It silently
+   * invalidates that exception, because the model would then be able to hold
+   * something that no longer descends from the read the pending write was
+   * authorised by. A background refresh, a realtime subscription writing
+   * server rows into state, an "undo" restoring a snapshot from before the
+   * load, a second `read()` on reconnect — each is a reasonable feature and
+   * each breaks it.
+   *
+   * If one is ever added, the load epoch is the thing to reason about, not
+   * this comment: anything that replaces `model` with state the user did not
+   * type must advance `loadEpochRef` the way `loadInitial` does, so pushes
+   * scheduled against the old state are refused rather than sent.
+   */
   const [model, setModel] = useState<Model>(EMPTY_MODEL);
   const [result, setResult] = useState<ScheduleResult>(EMPTY_RESULT);
   const [lastCalculatedHash, setLastCalculatedHash] = useState<string | null>(null);
@@ -310,6 +340,12 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
           // resolved, authorised read plus the user's own edits on top. If the
           // owner re-approves, the next push is the right thing to send —
           // advancing it would instead strand every edit made since.
+          //
+          // "Plus the user's own edits on top" is the load-bearing half, and
+          // it is a claim about who may write to `model` — see the invariant
+          // on its declaration above (F9). Add a third mutator without
+          // advancing the epoch and this exception stops being safe, with
+          // nothing here to notice.
           setStatus('forbidden');
           setNotice(REVOKED_NOTICE);
           return;
