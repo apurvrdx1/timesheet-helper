@@ -20,10 +20,26 @@
  * partial save, it is a delete of everything the account had.
  *
  * The adapter cannot enforce that from where it sits; it is handed a state and
- * has no way to know where the caller got it. So the store carries the flag:
- * `safeToWriteRef` starts false, and is set true by exactly one thing — a
- * `read()` that resolved, for this mount, with the whole account's state in
- * hand. `pushToAdapter` refuses to write while it is false.
+ * has no way to know where the caller got it. So the store carries the
+ * provenance itself, as a LOAD EPOCH: `loadEpochRef` starts at `0`, meaning
+ * no read has resolved for this mount, and is incremented by exactly one
+ * thing — a `read()` that resolved with the whole account's state in hand.
+ *
+ * A boolean was not enough, and the way it failed is the reason this is a
+ * counter. `update` captures its model in a 2s debounce closure; the flag was
+ * consulted when the TIMER FIRED. Type into the planner while the mount read
+ * is still in flight and the closure holds the app's own empty placeholder
+ * plus one keystroke — then the read resolves, the flag flips true, the timer
+ * fires, the guard says yes, and the whole account is replaced by that
+ * placeholder. A flag proves that A READ SUCCEEDED. It cannot prove that the
+ * state being written DESCENDS FROM that read, and only the second claim is
+ * safe.
+ *
+ * The epoch proves descent. Every push carries the epoch that was current
+ * when it was SCHEDULED, and `pushToAdapter` refuses unless that stamp still
+ * matches `loadEpochRef.current` when it runs. `0` never matches (nothing has
+ * been read), and a stamp from before a read no longer matches after it, so a
+ * state that predates the read it would be written under cannot be sent.
  *
  * This replaces v1's `unreadableTabs`, which protected individual tabs the app
  * could not parse. There are no tabs and no partial writes any more, so the
@@ -157,6 +173,18 @@ const UNSAFE_PUSH_NOTICE =
   'Your changes are not being saved: this session never loaded your stored data, and saving now ' +
   'would replace it with what is on screen. Reload this page to load it.';
 
+/**
+ * What the app says about a push whose state predates the load.
+ *
+ * A separate sentence from `UNSAFE_PUSH_NOTICE` on purpose: the data DID
+ * load, so "reload this page" would be wrong advice, and the edit is gone
+ * from the screen as well as from the database — the loaded state replaced
+ * it. The only true thing to say is that it was not saved and why.
+ */
+const SUPERSEDED_PUSH_NOTICE =
+  'Your stored data finished loading while you were editing, and replaced what was on screen, so ' +
+  'that change was not saved. Make it again on the loaded data.';
+
 /** Every month the model allocates into, deduplicated and sorted. */
 export function monthsOf(model: Model): IsoMonth[] {
   return [...new Set(model.allocations.map((a) => a.month))].sort();
@@ -232,23 +260,39 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
   hashRef.current = lastCalculatedHash;
 
   /**
-   * The flag, in the form the debounce timer can read.
+   * The provenance stamp, in the form the debounce timer can read.
    *
-   * Deliberately a ref as well as state: a push already sitting on the 2s
-   * timer fires from a closure, and it has to consult the CURRENT verdict,
-   * not whichever one was true when the timer was set.
+   * `0` means no read has resolved for this mount; each resolved read gets
+   * the next number. A ref rather than state because a push already sitting
+   * on the 2s timer fires from a closure and must compare against the CURRENT
+   * epoch, and because the value it captured has to be the one that was
+   * current at SCHEDULE time — a re-render must not be able to move it.
    */
-  const safeToWriteRef = useRef(false);
+  const loadEpochRef = useRef(0);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  /**
+   * @param epoch The load epoch that was current when this push was
+   * SCHEDULED. The push is sent only if it still is — see the file header.
+   */
   const pushToAdapter = useCallback(
-    async (pushModel: Model, entries: ScheduleResult['entries'], hash: string | null) => {
+    async (
+      epoch: number,
+      pushModel: Model,
+      entries: ScheduleResult['entries'],
+      hash: string | null,
+    ) => {
       // The guard. `write` replaces the whole account, so a state that did not
-      // come from a resolved read is not a save — it is a deletion of whatever
-      // the account really holds.
-      if (!safeToWriteRef.current) {
-        setNotice(UNSAFE_PUSH_NOTICE);
+      // descend from a resolved read is not a save — it is a deletion of
+      // whatever the account really holds.
+      if (epoch !== loadEpochRef.current || epoch === 0) {
+        // Two different failures, and telling them apart is the whole point.
+        // Nothing has ever loaded: the state on screen is the app's own
+        // placeholder, and only a load can fix it. Or a load has since landed
+        // and replaced this state: the data is there, this particular edit is
+        // not, and asking for a reload would be wrong.
+        setNotice(loadEpochRef.current === 0 ? UNSAFE_PUSH_NOTICE : SUPERSEDED_PUSH_NOTICE);
         return;
       }
 
@@ -261,11 +305,11 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
         if (isNotApproved(error)) {
           // Access was withdrawn mid-session.
           //
-          // `safeToWriteRef` deliberately stays TRUE here. The rule is about
-          // the PROVENANCE of the state, and this state still came from a
+          // The load epoch deliberately does NOT move here. The rule is about
+          // the PROVENANCE of the state, and this state still descends from a
           // resolved, authorised read plus the user's own edits on top. If the
           // owner re-approves, the next push is the right thing to send —
-          // dropping the flag would instead strand every edit made since.
+          // advancing it would instead strand every edit made since.
           setStatus('forbidden');
           setNotice(REVOKED_NOTICE);
           return;
@@ -297,8 +341,10 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
         setResult({ entries: state.entries, residuals: [], violations: [] });
         setLastCalculatedHash(state.hash);
 
-        // Set here and nowhere else.
-        safeToWriteRef.current = true;
+        // Advanced here and nowhere else. Every push scheduled before this
+        // line captured an earlier epoch and can no longer be sent — which is
+        // exactly right: the state it carries has just been replaced above.
+        loadEpochRef.current += 1;
         setIsSafeToWrite(true);
 
         setStatus('idle');
@@ -336,13 +382,18 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
 
   const update = useCallback(
     (fn: (model: Model) => Model) => {
+      // Read before `setModel`, so it is the epoch at the moment of the EDIT
+      // and not whatever the updater happens to run under. (React may call
+      // the updater twice, or later; neither must change the stamp.)
+      const epoch = loadEpochRef.current;
+
       setModel((previous) => {
         const next = fn(previous);
 
         if (debounceRef.current !== null) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => {
           debounceRef.current = null;
-          void pushToAdapter(next, resultRef.current.entries, hashRef.current);
+          void pushToAdapter(epoch, next, resultRef.current.entries, hashRef.current);
         }, PUSH_DEBOUNCE_MS);
 
         return next;
@@ -405,7 +456,8 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
       clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
-    void pushToAdapter(currentModel, newResult.entries, hash);
+    // Sent immediately, so the epoch it captures is the one it runs under.
+    void pushToAdapter(loadEpochRef.current, currentModel, newResult.entries, hash);
   }, [pushToAdapter]);
 
   return {

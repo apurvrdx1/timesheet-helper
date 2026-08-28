@@ -633,3 +633,123 @@ describe('useStore: a certified schedule that lost its allocations is still repo
     expect(result.current.hasCertifiedSchedule).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 9, review finding F1.
+//
+// The flag proves that A read succeeded. It does not prove that the state
+// being written DESCENDS FROM that read, and only the second claim is safe.
+// An edit typed while the mount read is still in flight captures a PRE-READ
+// model in the debounce closure; if the read resolves before the timer fires,
+// the flag is true by the time the guard is consulted and the pre-read model
+// — the app's own empty placeholder plus one keystroke — is sent to a write
+// that replaces the WHOLE account.
+// ---------------------------------------------------------------------------
+
+/** A read the test resolves by hand, so the in-flight window stays open. */
+function adapterWithHeldRead(): FakeAdapter & { resolveRead: (state: StoredState) => void } {
+  let release: ((state: StoredState) => void) | null = null;
+  const read = vi.fn(
+    () => new Promise<StoredState>((resolve) => {
+      release = resolve;
+    }),
+  );
+  return {
+    read,
+    write: vi.fn(async () => {}),
+    resolveRead(state: StoredState): void {
+      if (release === null) throw new Error('read() has not been called yet');
+      release(state);
+    },
+  };
+}
+
+describe('useStore: an edit made while the mount read is still in flight', () => {
+  const STORED: StoredState = {
+    model: withOneAllocation(emptyModel),
+    entries: [STORED_ENTRY],
+    hash: 'stored-hash',
+  };
+
+  it('never writes a state that predates the read which authorised the write', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterWithHeldRead();
+
+    const { result } = renderHook(() => useStore(adapter));
+    // The window: the read is in flight, so nothing on screen came from it.
+    expect(result.current.isSafeToWrite).toBe(false);
+
+    // The user types into the apparently-empty planner. This schedules a push
+    // carrying the model AS IT IS NOW — the empty placeholder plus the edit.
+    act(() => {
+      result.current.update((model) => ({
+        ...model,
+        people: [{ id: 'typed', name: 'Typed while loading', role: 'MANAGER', managerId: null }],
+      }));
+    });
+
+    // The read resolves. The account's real state — 1 OTL, 1 person, 1
+    // allocation — replaces the screen, and the store becomes safe to write.
+    await act(async () => {
+      adapter.resolveRead(STORED);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.isSafeToWrite).toBe(true);
+    expect(result.current.model.allocations).toHaveLength(1);
+
+    // The debounce fires, consults the flag, and finds it true.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    // The finding: `write` is an unconditional whole-account replace, so
+    // sending the pre-read model deletes the OTL, the allocation and the real
+    // person, atomically, and leaves a hash certifying the destroyed model.
+    const sentModels = adapter.write.mock.calls.map((call) => call[0].model);
+    expect(sentModels.some((model) => model.people.some((p) => p.id === 'typed'))).toBe(false);
+    expect(sentModels.some((model) => model.allocations.length === 0)).toBe(false);
+    // Refusal, not substitution: the queued push descends from a state the
+    // read has already thrown away, so there is nothing left to save.
+    expect(adapter.write).not.toHaveBeenCalled();
+    // And the account still holds what the read found.
+    expect(result.current.model.people).toHaveLength(1);
+    expect(result.current.model.otls).toHaveLength(1);
+  });
+
+  it('still writes an edit made after the read resolved', async () => {
+    // The guard is about DESCENT, not about having ever been unsafe: a mount
+    // that once had a pre-read edit must not be poisoned for the rest of its
+    // life. Edits made on top of the read still save.
+    vi.useFakeTimers();
+    const adapter = adapterWithHeldRead();
+    const { result } = renderHook(() => useStore(adapter));
+
+    act(() => {
+      result.current.update((model) => ({
+        ...model,
+        people: [{ id: 'typed', name: 'Typed while loading', role: 'MANAGER', managerId: null }],
+      }));
+    });
+    await act(async () => {
+      adapter.resolveRead(STORED);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(adapter.write).not.toHaveBeenCalled();
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(adapter.write).toHaveBeenCalledTimes(1);
+    const sent = adapter.write.mock.calls[0]?.[0];
+    // Descends from the read: the account's own person plus the new one.
+    expect(sent?.model.people).toHaveLength(2);
+    expect(sent?.model.allocations).toHaveLength(1);
+  });
+});

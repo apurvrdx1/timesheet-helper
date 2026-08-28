@@ -19,6 +19,8 @@ import { neutralTheme } from '@astryxdesign/theme-neutral/built';
 import { Section } from '@astryxdesign/core/Section';
 import { Layout, LayoutContent, LayoutHeader } from '@astryxdesign/core/Layout';
 import { HStack } from '@astryxdesign/core/HStack';
+import { VStack } from '@astryxdesign/core/VStack';
+import { Spinner } from '@astryxdesign/core/Spinner';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Text } from '@astryxdesign/core/Text';
 import { Button } from '@astryxdesign/core/Button';
@@ -212,7 +214,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
  */
 export function Planner() {
   const {
-    model, isStale, needsAllocation, hasCertifiedSchedule, status, notice,
+    model, isStale, needsAllocation, hasCertifiedSchedule, status, notice, isSafeToWrite,
     update, cancelPendingPush, recalculate,
   } = useStore();
   // A second `useSession()` — `AuthGate` has its own, and AdminPage already
@@ -235,6 +237,37 @@ export function Planner() {
   // model" — the store's `update` takes an updater function instead, so
   // this adapts one shape to the other in exactly one place.
   const applyModel = useCallback((next: Model) => update(() => next), [update]);
+
+  /**
+   * The mount read is still in flight and nothing has ever loaded.
+   *
+   * `isSafeToWrite` turns true only when a read resolves and never turns
+   * false again, so this is the initial load and nothing else: a later save
+   * is `'syncing'` too, and a load that FAILED lands on `'error'` or
+   * `'forbidden'` with a banner that says so.
+   */
+  const isLoadingAccount = status === 'syncing' && !isSafeToWrite;
+
+  if (isLoadingAccount) {
+    // DESIGN.md §4 "Loading": no spinner for this app's own local, millisecond
+    // computation, but the account read is a real Supabase round trip and
+    // there is nothing drawn yet to put a Banner over — the same case
+    // `AuthGate` already uses a `Spinner` for.
+    //
+    // Not merely cosmetic. Every control on the pages below calls the store's
+    // `update`, and an edit made in this window descends from the app's own
+    // empty placeholder, not from the account (store.ts, the load epoch). The
+    // store refuses to write such an edit, and the read replaces it on screen
+    // the moment it lands — so offering a fully interactive, apparently-EMPTY
+    // planner here is inviting work that is guaranteed to be thrown away.
+    return (
+      <Section variant="section" maxWidth={1440} padding={8}>
+        <VStack align="center" justify="center" gap={4}>
+          <Spinner aria-label="Loading your data" size="lg" />
+        </VStack>
+      </Section>
+    );
+  }
 
   // A model with no allocated month has nothing for `recalculate` to place,
   // so Recalculate is not offered for it — a primary action that can only

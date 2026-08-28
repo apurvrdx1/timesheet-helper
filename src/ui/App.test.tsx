@@ -341,6 +341,36 @@ describe('App', () => {
   });
 });
 
+describe('App: the account is still loading', () => {
+  it('shows a loading state instead of an editable, apparently-empty planner', async () => {
+    // The mount read, held in flight for the whole test — the window in which
+    // the account's real contents are not on screen yet.
+    adapterControl.read = () => new Promise(() => {});
+
+    render(<App />);
+    await settle();
+
+    // Nothing to type into. Every Setup control calls the store's `update`,
+    // and an edit made in this window descends from the app's own empty
+    // placeholder rather than from the account (see store.test.ts, F1) — so
+    // the invitation to type must not be on screen at all.
+    expect(screen.queryByRole('button', { name: /add otl/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /cost-centre codes/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /allocations/i })).not.toBeInTheDocument();
+    // And the wait is named. DESIGN.md §4: a genuine network round trip with
+    // nothing yet drawn is the one case the Spinner is for, as in `AuthGate`.
+    expect(screen.getByRole('status', { name: /loading/i })).toBeInTheDocument();
+  });
+
+  it('shows the planner once the read resolves', async () => {
+    render(<App />);
+    await settle();
+
+    expect(screen.queryByRole('status', { name: /loading/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /add otl/i })).toBeInTheDocument();
+  });
+});
+
 describe('App: the account it is signed in as', () => {
   it('shows the signed-in address and a way out, in place of the old connection settings', async () => {
     render(<App />);
