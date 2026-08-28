@@ -8,6 +8,13 @@ against each CAPEX code this month. The app produces a Monday-to-Friday schedule
 respects a minimum OPEX commitment, fills every day to 7.5 hours, works around leave, and
 preserves any figure you set by hand.
 
+> **⚠️ This README is out of date and is being rewritten.**
+> The app has moved to multi-admin accounts backed by Supabase. The three storage
+> backends described below — Google Sheets, Microsoft 365, and browser-local — have
+> been **deleted**, along with the setup instructions and links to them further down.
+> Sign-in is now required. See `supabase/README.md` for how the current data layer
+> works until this page is replaced.
+
 Single user, no server, no database. It runs entirely in your browser and stores its data
 wherever you point it — a Google Sheet, a Microsoft 365 workbook, or just the browser
 itself.

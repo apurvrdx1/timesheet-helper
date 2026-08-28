@@ -45,6 +45,37 @@
  * could not parse. There are no tabs and no partial writes any more, so the
  * protection is all-or-nothing and lives in one flag.
  *
+ * ## What the epoch does NOT protect: two tabs (review finding F4)
+ *
+ * The epoch is per-mount. It proves a write descends from the read THIS tab
+ * did; it knows nothing about any other tab. So: open the account twice, let
+ * both reads resolve, edit in tab A, then edit in tab B. Both writes are
+ * legitimately authorised, and the second one wins.
+ *
+ * That is ordinary last-writer-wins, except for one thing that makes it
+ * materially worse here, and which is why it is written down rather than left
+ * to be discovered: because `write` is a WHOLE-ACCOUNT REPLACE, the losing
+ * tab does not lose the field it was editing. It loses everything it never
+ * knew about — every change the other tab made since they diverged, across
+ * all eight tables. A conflict on one cell reverts the whole account to a
+ * different tab's picture of it.
+ *
+ * RULING (controller, v2): ACCEPTED AS DEBT FOR THIS RELEASE, not overlooked.
+ * The product is one admin maintaining their own team's data, so two tabs
+ * editing one account concurrently is a real but secondary flow, and closing
+ * it properly is not a small change: it needs the base hash sent with the
+ * write, a comparison inside `replace_state`, a new migration, and a conflict
+ * UX for the tab that loses. Shipping that hastily at this stage would add
+ * risk to the exact write path this release spent its whole review budget
+ * making safe.
+ *
+ * THE FIX, WHEN IT IS DONE: `meta.model_hash` already records what the
+ * account looked like when this tab read it. Send it as a base hash, have
+ * `replace_state` raise when it no longer matches what is stored, and surface
+ * that to the user as "this account changed in another tab — reload" rather
+ * than silently overwriting. Optimistic concurrency, one extra column in one
+ * comparison.
+ *
  * ## Approval comes from `profiles`, never from an empty read
  *
  * A revoked account's selects all succeed and all return nothing — RLS hides
