@@ -753,3 +753,233 @@ describe('useStore: an edit made while the mount read is still in flight', () =>
     expect(sent?.model.allocations).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review finding F2.
+//
+// Ported from the suite Task 9 deleted along with v1's storage layer — see
+// `git show f3ea6fb:src/storage/store.test.ts`, describe blocks "the Schedule
+// tab is never cleared by a result nobody computed" and "Meta never certifies
+// a Schedule that was not written". The tabs are gone; the invariant they
+// protected is not, and nothing in the surviving suite held it.
+//
+// v1 pushed one tab at a time and kept the invariant by OMITTING `Schedule`
+// and `Meta` from a push that had neither. There are no partial writes any
+// more: `StorageAdapter.write` is a whole-account replace and every push
+// carries all three parts of `StoredState` — model, entries, hash. So the
+// same invariant now reads:
+//
+//   EVERY PUSH CARRIES THE ENTRIES AND THE HASH THE STORE IS CURRENTLY
+//   HOLDING — the ones the last completed calculation (or the load) left
+//   behind — AND THE TWO TRAVEL TOGETHER.
+//
+// Both halves are silent data loss when broken, and neither is a line
+// coverage can reach: `src/storage` sat at 100% line coverage with both of
+// the mutations below green.
+//
+//   * entries dropped (`pushToAdapter(..., [], hash)`): every keystroke
+//     deletes every schedule row the account owns, while the hash it sends
+//     goes on certifying them. The Schedule the user calculated is gone and
+//     nothing says so.
+//   * hash dropped (`pushToAdapter(..., entries, null)`): every keystroke
+//     destroys the certificate. That is v1's permanent-nag staleness bug
+//     (amendment A1) rebuilt from scratch — the schedule rows survive, the
+//     proof that they match the model does not, and after a reload the stale
+//     banner can never be cleared for a model that really is up to date.
+// ---------------------------------------------------------------------------
+
+/** The stored state of an account that calculated a schedule last session. */
+const STORED_STATE: StoredState = {
+  model: withOneAllocation(emptyModel),
+  entries: [STORED_ENTRY],
+  hash: 'stored-hash',
+};
+
+/** Undoes `addAPerson`, landing back on exactly the model that was loaded. */
+const removeThatPerson = (model: Model): Model => ({
+  ...model,
+  people: model.people.filter((person) => person.id !== 'p2'),
+});
+
+describe('useStore: a push never clears a schedule nobody recalculated', () => {
+  it('sends the loaded schedule with a keystroke that recalculated nothing', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterReading(STORED_STATE);
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+    // The load restored last session's schedule. Nothing has recalculated.
+    expect(result.current.result.entries).toEqual([STORED_ENTRY]);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(adapter.write).toHaveBeenCalledTimes(1);
+    const sent = adapter.write.mock.calls[0]?.[0];
+    // The finding: `write` replaces the whole account, so an empty `entries`
+    // here is not "no schedule sent", it is every schedule row deleted by a
+    // keystroke that never asked for a recalculation.
+    expect(sent?.entries).toEqual([STORED_ENTRY]);
+  });
+
+  it('sends the recalculated schedule with the keystroke that follows a recalculate', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterReading();
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+
+    act(() => {
+      result.current.update(withOneAllocation);
+    });
+    act(() => {
+      result.current.recalculate();
+    });
+    await settle();
+
+    const recalculated = adapter.write.mock.calls[0]?.[0];
+    expect(recalculated?.entries.length).toBeGreaterThan(0);
+
+    // A single keystroke on top of a fresh calculation.
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    const sent = adapter.write.mock.calls[1]?.[0];
+    expect(sent?.entries).toEqual(recalculated?.entries);
+  });
+
+  it('sends an empty schedule only when the store genuinely holds one', async () => {
+    // The other direction, so the assertions above cannot be satisfied by a
+    // store that simply always sends something: a brand-new account has no
+    // schedule, and the push must say so rather than invent one.
+    vi.useFakeTimers();
+    const adapter = adapterReading();
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+    expect(result.current.result.entries).toEqual([]);
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(adapter.write.mock.calls[0]?.[0].entries).toEqual([]);
+  });
+});
+
+describe('useStore: a push never destroys the certificate of a schedule it kept', () => {
+  it('sends the loaded hash with a keystroke that recalculated nothing', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterReading(STORED_STATE);
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    const sent = adapter.write.mock.calls[0]?.[0];
+    // A `null` here would be a keystroke telling the database that a schedule
+    // it is still storing was never calculated.
+    expect(sent?.hash).toBe('stored-hash');
+  });
+
+  it('keeps the hash and the entries it certifies in the same write', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterReading();
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+
+    act(() => {
+      result.current.update(withOneAllocation);
+    });
+    act(() => {
+      result.current.recalculate();
+    });
+    await settle();
+    const recalculated = adapter.write.mock.calls[0]?.[0];
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    const sent = adapter.write.mock.calls[1]?.[0];
+    // The pair moves as a pair. Splitting them — either half without the
+    // other — is how the store ends up storing a schedule it cannot vouch
+    // for, or a certificate for rows that are no longer there.
+    expect(sent?.hash).toBe(recalculated?.hash);
+    expect(sent?.entries).toEqual(recalculated?.entries);
+  });
+
+  it('sends a null hash only when nothing has ever been calculated', async () => {
+    // `null` is a real, distinct fact (`StoredState.hash`), so the guard
+    // above must not be satisfiable by never sending one.
+    vi.useFakeTimers();
+    const adapter = adapterReading();
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(adapter.write.mock.calls[0]?.[0].hash).toBeNull();
+  });
+
+  it('leaves what a keystroke wrote reloadable, so the stale banner still clears', async () => {
+    // The harm, end to end and in the user's terms. Take what a plain
+    // keystroke actually pushed, reload from it, and undo the keystroke: the
+    // model is once again exactly the one the stored hash certifies, so the
+    // banner must go away and last session's schedule must still be on
+    // screen. Drop either half of the push and this session can never be
+    // told its schedule is current again — v1's permanent nag, rebuilt.
+    vi.useFakeTimers();
+    const { hashModel } = await import('../domain/hash');
+    const model = withOneAllocation(emptyModel);
+    const certified: StoredState = { model, entries: [STORED_ENTRY], hash: hashModel(model) };
+
+    const adapter = adapterReading(certified);
+    const first = renderHook(() => useStore(adapter));
+    await settle();
+    expect(first.result.current.isStale).toBe(false);
+
+    act(() => {
+      first.result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    const persisted = adapter.write.mock.calls[0]?.[0];
+    if (persisted === undefined) throw new Error('expected the keystroke to have been pushed');
+    first.unmount();
+
+    // Next session, reading back exactly what that keystroke stored.
+    const reloaded = renderHook(() => useStore(adapterReading(persisted)));
+    await settle();
+
+    act(() => {
+      reloaded.result.current.update(removeThatPerson);
+    });
+
+    expect(reloaded.result.current.isStale).toBe(false);
+    expect(reloaded.result.current.result.entries).toEqual([STORED_ENTRY]);
+    expect(reloaded.result.current.hasCertifiedSchedule).toBe(true);
+  });
+});
