@@ -92,7 +92,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../auth/client';
 import { createSupabaseAdapter } from './supabase';
-import { INSUFFICIENT_PRIVILEGE, StorageError } from './modelAdapter';
+import { INSUFFICIENT_PRIVILEGE, StorageError, isUnreachableStatus } from './modelAdapter';
 import type { StorageAdapter } from './modelAdapter';
 import { hashModel } from '../domain/hash';
 import { scheduleAll } from '../domain/schedule';
@@ -274,43 +274,20 @@ function isNotApproved(error: unknown): boolean {
 }
 
 /**
- * The statuses that mean "nothing in Postgres ran", as opposed to "Postgres
- * ran something and it went wrong".
- *
- * * `0` — the fetch never landed: DNS did not resolve, the connection was
- *   refused, or the client is offline. A paused Supabase project's host stops
- *   resolving, so this is the likelier of the two shapes for one.
- * * `503` — something in front of the database answered for it.
- * * `520` — Cloudflare's version of the same.
- *
- * `503` and `520` are exactly `postgrest-js`'s own `RETRYABLE_STATUS_CODES`,
- * which is not a coincidence: it retries them because they are the transient,
- * nothing-ran failures. It retries GET/HEAD/OPTIONS only, three times, with
- * 1s/2s/4s backoff — so a failing read can take about 7 seconds to arrive here
- * while a failing `rpc` (a POST, and both `write` and the approval check are
- * POSTs) arrives on the first attempt. Either way the notice must not sound
- * instant.
- */
-const UNREACHABLE_STATUSES: readonly number[] = [0, 503, 520];
-
-/**
  * True when the failure is the database not being there, rather than the
  * database refusing or failing.
  *
  * Branches on the STATUS, never on the message — the same rule `isNotApproved`
  * follows and for the same reason, with one extra pressure behind it here:
- * these failures have no useful `code` to branch on either. A fetch that never
- * landed reports `code: ''`, and a 503 whose body is not PostgREST JSON
- * reports no code at all, so the status is the only signal there is. `null`
- * status (the adapter raised it itself — a short or torn read) is not in the
- * list and must not be: that read reached the database perfectly well.
+ * these failures have no useful `code` to branch on either. The status list
+ * itself (`0`, `503`, `520`) and the reasoning behind each entry live on
+ * `isUnreachableStatus` in `modelAdapter.ts`, which is also where
+ * `src/auth/useSession.ts` reads it — the sleeping-database NOTICE here and
+ * the sleeping-database SCREEN at the gate must mean the same thing by the
+ * same rule.
  */
 function isUnreachable(error: unknown): boolean {
-  return (
-    error instanceof StorageError &&
-    error.status !== null &&
-    UNREACHABLE_STATUSES.includes(error.status)
-  );
+  return error instanceof StorageError && isUnreachableStatus(error.status);
 }
 
 /**

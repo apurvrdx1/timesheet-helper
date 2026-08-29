@@ -185,7 +185,11 @@ let consoleError: ReturnType<typeof vi.spyOn> | null = null;
 beforeEach(() => {
   adapterControl.write.mockClear();
   mockedUseSession.mockReturnValue({
-    session: makeSession(), profile: APPROVED, loading: false, signOut: vi.fn(async () => {}),
+    session: makeSession(),
+    profile: APPROVED,
+    loading: false,
+    databaseUnreachable: false,
+    signOut: vi.fn(async () => {}),
   });
   // React logs the caught error itself; the boundary logs the detail. Neither
   // is the thing under test and both would drown the run.

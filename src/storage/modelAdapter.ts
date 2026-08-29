@@ -136,3 +136,47 @@ export class StorageError extends Error {
  * denied read masquerade as an empty account. See `createSupabaseAdapter`.
  */
 export const INSUFFICIENT_PRIVILEGE = '42501';
+
+/**
+ * The statuses that mean "nothing in Postgres ran", as opposed to "Postgres
+ * ran something and it went wrong".
+ *
+ * * `0` — the fetch never landed: DNS did not resolve, the connection was
+ *   refused, or the client is offline. A paused Supabase project's host stops
+ *   resolving, so this is the likelier of the two shapes for one.
+ * * `503` — something in front of the database answered for it.
+ * * `520` — Cloudflare's version of the same.
+ *
+ * `503` and `520` are exactly `postgrest-js`'s own `RETRYABLE_STATUS_CODES`,
+ * which is not a coincidence: it retries them because they are the transient,
+ * nothing-ran failures. It retries GET/HEAD/OPTIONS only, three times, with
+ * 1s/2s/4s backoff — so a failing read can take about 7 seconds to arrive here
+ * while a failing `rpc` (a POST, and both `write` and the approval check are
+ * POSTs) arrives on the first attempt. Either way the notice must not sound
+ * instant.
+ *
+ * Lives here, next to `StorageError.status`, rather than in the one caller
+ * that first needed it: `store.ts` branches on it for the sleeping-database
+ * notice, and `src/auth/useSession.ts` branches on it for the sleeping-database
+ * SCREEN — the two must not drift into two different vocabularies for the same
+ * failure (pre-merge review H1).
+ */
+export const UNREACHABLE_STATUSES: readonly number[] = [0, 503, 520];
+
+/**
+ * True when an HTTP status reports that the database was not there at all.
+ *
+ * Branches on the STATUS, never on the message — these failures have no useful
+ * `code` to branch on either. A fetch that never landed reports `code: ''`, and
+ * a 503 whose body is not PostgREST JSON reports no code at all, so the status
+ * is the only signal there is.
+ *
+ * `null`/`undefined` is NOT unreachable and must not be: `null` is what a
+ * `StorageError` the adapter raised itself carries (a short or torn read),
+ * and that read reached the database perfectly well. `0` is a real value and
+ * means the request never reached anything — the two must not be treated
+ * alike.
+ */
+export function isUnreachableStatus(status: number | null | undefined): boolean {
+  return status !== null && status !== undefined && UNREACHABLE_STATUSES.includes(status);
+}

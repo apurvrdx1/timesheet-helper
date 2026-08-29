@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './client';
+import { isUnreachableStatus } from '../storage/modelAdapter';
 
 export interface Profile {
   id: string;
@@ -33,6 +34,22 @@ export interface UseSessionResult {
   session: Session | null;
   profile: Profile | null;
   loading: boolean;
+  /**
+   * True when the last profile fetch did not reach the database at all —
+   * a paused Supabase project, a refused connection, an offline client.
+   *
+   * The distinction `profile: null` cannot make on its own, and the reason
+   * this field exists: a `null` profile means EITHER "the row is not there
+   * yet" (the `handle_new_user` race, genuinely pending) OR "we could not
+   * ask" (nothing in Postgres ran). Collapsing the two told the owner to wait
+   * for an approval only they can give, from behind a gate only they can pass
+   * — pre-merge review H1. `AuthGate` shows a different screen for each.
+   *
+   * Judged by HTTP status, never by message, using the same
+   * `isUnreachableStatus` vocabulary `store.ts` uses for the equivalent
+   * notice behind the gate.
+   */
+  databaseUnreachable: boolean;
   signOut: () => Promise<void>;
 }
 
@@ -53,6 +70,7 @@ export function useSession(): UseSessionResult {
   const [session, setSession] = useState<Session | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [sessionKnown, setSessionKnown] = useState(false);
+  const [databaseUnreachable, setDatabaseUnreachable] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
 
   useEffect(() => {
@@ -78,6 +96,7 @@ export function useSession(): UseSessionResult {
 
     if (userId === null) {
       setProfile(null);
+      setDatabaseUnreachable(false);
       return;
     }
 
@@ -89,7 +108,7 @@ export function useSession(): UseSessionResult {
       .select<'id, email, approved, is_owner', ProfileRow>('id, email, approved, is_owner')
       .eq('id', userId)
       .maybeSingle()
-      .then(({ data, error }) => {
+      .then(({ data, error, status }) => {
         if (cancelled) {
           return;
         }
@@ -98,11 +117,20 @@ export function useSession(): UseSessionResult {
           // so a missing row is expected and handled below via
           // `.maybeSingle()` returning `data: null, error: null` — this
           // branch is a real failure (network, RLS, etc.), not that race.
+          //
+          // `status` comes off the RESPONSE ENVELOPE, not off the error, for
+          // the reason `src/storage/supabase.ts` reads it the same way: a
+          // database that is not there has no SQLSTATE, because nothing in
+          // Postgres ever ran. That case gets its own screen; every other
+          // failure keeps the original behaviour of falling through to the
+          // waiting screen, which must never show the app.
           // eslint-disable-next-line no-console
           console.warn('Failed to load profile:', error.message);
           setProfile(null);
+          setDatabaseUnreachable(isUnreachableStatus(status));
         } else {
           setProfile(data === null ? null : toProfile(data));
+          setDatabaseUnreachable(false);
         }
         setProfileLoading(false);
       });
@@ -120,9 +148,10 @@ export function useSession(): UseSessionResult {
     }
     setSession(null);
     setProfile(null);
+    setDatabaseUnreachable(false);
   }, []);
 
   const loading = !sessionKnown || profileLoading;
 
-  return { session, profile, loading, signOut };
+  return { session, profile, loading, databaseUnreachable, signOut };
 }

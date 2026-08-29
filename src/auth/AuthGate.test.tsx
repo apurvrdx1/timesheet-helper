@@ -63,6 +63,7 @@ function setSession(result: Partial<UseSessionResult>): void {
     session: null,
     profile: null,
     loading: false,
+    databaseUnreachable: false,
     signOut: vi.fn(),
     ...result,
   });
@@ -113,6 +114,44 @@ describe('AuthGate', () => {
     );
 
     expect(screen.getByRole('heading', { name: /waiting for approval/i })).toBeInTheDocument();
+    expect(screen.queryByText('App content')).not.toBeInTheDocument();
+  });
+
+  it('shows the database-asleep screen, NOT the pending screen, when the profile fetch could not reach the database', () => {
+    // H1. A paused Supabase project fails the profile fetch, which used to
+    // collapse to `profile: null` and render "Waiting for approval" — telling
+    // the OWNER to wait for an approval only they can give, from behind a gate
+    // only they can pass. The two causes are now distinct, and so is the copy.
+    const session = makeSession('owner-1', 'owner@example.com');
+    setSession({ session, profile: null, databaseUnreachable: true, loading: false });
+
+    render(
+      <AuthGate>
+        <div>App content</div>
+      </AuthGate>,
+    );
+
+    expect(screen.getByRole('heading', { name: /could not reach the database/i })).toBeInTheDocument();
+    expect(screen.getByText(/asleep|sleep/i)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /waiting for approval/i })).not.toBeInTheDocument();
+    expect(screen.queryByText('App content')).not.toBeInTheDocument();
+  });
+
+  it('shows the pending screen, not the asleep screen, for a null profile from a fetch that succeeded', () => {
+    // The handle_new_user trigger race: the fetch worked, there was no row.
+    // This must keep its original behaviour — the asleep screen would be a
+    // lie, and would hide a genuinely pending account from its own message.
+    const session = makeSession('brand-new-user', 'brand-new@example.com');
+    setSession({ session, profile: null, databaseUnreachable: false, loading: false });
+
+    render(
+      <AuthGate>
+        <div>App content</div>
+      </AuthGate>,
+    );
+
+    expect(screen.getByRole('heading', { name: /waiting for approval/i })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /could not reach the database/i })).not.toBeInTheDocument();
     expect(screen.queryByText('App content')).not.toBeInTheDocument();
   });
 

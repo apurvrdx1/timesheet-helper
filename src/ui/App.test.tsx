@@ -173,6 +173,7 @@ function signedIn(profile: Partial<Profile> = {}): void {
     session: makeSession(full.id, full.email),
     profile: full,
     loading: false,
+    databaseUnreachable: false,
     signOut,
   });
 }
@@ -420,7 +421,13 @@ describe('App: the account it is signed in as', () => {
   });
 
   it('renders nothing of the planner until the gate lets someone through', () => {
-    mockedUseSession.mockReturnValue({ session: null, profile: null, loading: false, signOut });
+    mockedUseSession.mockReturnValue({
+      session: null,
+      profile: null,
+      loading: false,
+      databaseUnreachable: false,
+      signOut,
+    });
     render(<App />);
 
     expect(screen.getByRole('heading', { name: /sign in/i })).toBeInTheDocument();
@@ -437,6 +444,7 @@ describe('App: the account it is signed in as', () => {
       session: makeSession('user-1', 'alex@example.com'),
       profile: makeProfile({ approved: false }),
       loading: false,
+      databaseUnreachable: false,
       signOut,
     });
 

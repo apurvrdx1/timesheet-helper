@@ -29,7 +29,19 @@ interface ProfileRow {
   is_owner: boolean;
 }
 
-type MaybeSingleResult = { data: ProfileRow | null; error: PostgrestError | null };
+/**
+ * PostgREST answers with an envelope, not just `{ data, error }`: `status` is
+ * on it too, and it is the ONLY signal that separates "the database refused
+ * this account" from "nothing in Postgres ran because the project is asleep"
+ * (a paused project reports `status: 0` or `503`/`520` and no useful `code`).
+ * The mock carries it for the same reason `src/storage/supabase.ts` reads it
+ * off the envelope rather than off the error.
+ */
+type MaybeSingleResult = {
+  data: ProfileRow | null;
+  error: PostgrestError | null;
+  status: number;
+};
 
 type OnAuthStateChangeCallback = (event: AuthChangeEvent, session: Session | null) => void;
 
@@ -116,6 +128,7 @@ describe('useSession', () => {
     mockFromChain({
       data: { id: 'user-1', email: 'alice@example.com', approved: true, is_owner: false },
       error: null,
+      status: 200,
     });
 
     const { result } = renderHook(() => useSession());
@@ -142,6 +155,7 @@ describe('useSession', () => {
     mockFromChain({
       data: { id: 'user-1', email: 'alice@example.com', approved: true, is_owner: true },
       error: null,
+      status: 200,
     });
     mockedSupabase.auth.signOut.mockResolvedValue({ error: null });
 
@@ -165,7 +179,7 @@ describe('useSession', () => {
     // sign-up. `.maybeSingle()` returns { data: null, error: null } for
     // zero rows — this must not be treated as a failure.
     const { emit } = mockAuthStateChange();
-    mockFromChain({ data: null, error: null });
+    mockFromChain({ data: null, error: null, status: 200 });
 
     const { result } = renderHook(() => useSession());
     emit('INITIAL_SESSION', makeSession('brand-new-user'));
@@ -186,6 +200,7 @@ describe('useSession', () => {
         hint: '',
         code: '42501',
       }),
+      status: 403,
     });
 
     const { result } = renderHook(() => useSession());
@@ -197,9 +212,91 @@ describe('useSession', () => {
     expect(result.current.profile).toBeNull();
   });
 
+  it.each([
+    ['a fetch that never landed', 0],
+    ['a gateway answering for the database', 503],
+    ["Cloudflare's version of the same", 520],
+  ])('reports the database unreachable for %s', async (_why, status) => {
+    // A paused Supabase project is this app's single most likely failure
+    // (store.ts's UNREACHABLE_LOAD_NOTICE), and it must NOT be reported as
+    // "your account is not approved": the owner would be told to wait for an
+    // approval only they can give, behind a gate only they can pass.
+    const { emit } = mockAuthStateChange();
+    mockFromChain({
+      data: null,
+      error: new PostgrestError({ message: 'TypeError: Failed to fetch', details: '', hint: '', code: '' }),
+      status,
+    });
+
+    const { result } = renderHook(() => useSession());
+    emit('INITIAL_SESSION', makeSession('user-1'));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.databaseUnreachable).toBe(true);
+    expect(result.current.profile).toBeNull();
+  });
+
+  it('does NOT report the database unreachable when the row is simply absent', async () => {
+    // The handle_new_user race: a successful fetch that found no row. This is
+    // the genuinely-pending case and must stay distinguishable from the one
+    // above, or the fix for it swallows the thing it was meant to separate.
+    const { emit } = mockAuthStateChange();
+    mockFromChain({ data: null, error: null, status: 200 });
+
+    const { result } = renderHook(() => useSession());
+    emit('INITIAL_SESSION', makeSession('brand-new-user'));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.databaseUnreachable).toBe(false);
+    expect(result.current.profile).toBeNull();
+  });
+
+  it('does NOT report the database unreachable when the database refuses the read', async () => {
+    // 403/42501 is Postgres running and saying no — reachable, and not this
+    // screen. Only the statuses that mean "nothing ran" get the asleep copy.
+    const { emit } = mockAuthStateChange();
+    mockFromChain({
+      data: null,
+      error: new PostgrestError({ message: 'permission denied', details: '', hint: '', code: '42501' }),
+      status: 403,
+    });
+
+    const { result } = renderHook(() => useSession());
+    emit('INITIAL_SESSION', makeSession('user-1'));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.databaseUnreachable).toBe(false);
+  });
+
+  it('clears an earlier unreachable report once a later fetch succeeds', async () => {
+    const { emit } = mockAuthStateChange();
+    mockFromChain({
+      data: null,
+      error: new PostgrestError({ message: 'Failed to fetch', details: '', hint: '', code: '' }),
+      status: 0,
+    });
+
+    const { result } = renderHook(() => useSession());
+    emit('INITIAL_SESSION', makeSession('user-1'));
+    await waitFor(() => expect(result.current.databaseUnreachable).toBe(true));
+
+    mockFromChain({
+      data: { id: 'user-2', email: 'bob@example.com', approved: true, is_owner: false },
+      error: null,
+      status: 200,
+    });
+    emit('SIGNED_IN', makeSession('user-2'));
+
+    await waitFor(() => expect(result.current.profile?.email).toBe('bob@example.com'));
+    expect(result.current.databaseUnreachable).toBe(false);
+  });
+
   it('unsubscribes from auth changes on unmount', () => {
     const { unsubscribe } = mockAuthStateChange();
-    mockFromChain({ data: null, error: null });
+    mockFromChain({ data: null, error: null, status: 200 });
 
     const { unmount } = renderHook(() => useSession());
     expect(unsubscribe).not.toHaveBeenCalled();
