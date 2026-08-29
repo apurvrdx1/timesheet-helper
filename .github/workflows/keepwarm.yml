@@ -1,0 +1,94 @@
+# Keeps the Supabase project from being paused for inactivity.
+#
+# A free Supabase project is paused after ~7 days with no activity, and a paused
+# project is not a degraded app — it is a dead one: every read fails and the app
+# opens on the "could not reach the database" notice until someone restores the
+# project by hand from the dashboard. Twice a week (Monday and Thursday, 09:00
+# UTC) leaves a margin of three or four days against that ~7 day window, so a
+# single missed run cannot pause the project on its own.
+#
+# ## What this job has to get right, and what the obvious version gets wrong
+#
+# 1. THE SECRET NAMES. This repo's secrets are `VITE_`-prefixed, because they
+#    are the same two values the Vite build injects. A GitHub secret that does
+#    not exist interpolates to the EMPTY STRING rather than failing, so naming
+#    them `SUPABASE_URL`/`SUPABASE_ANON_KEY` would send a request with no key at
+#    no host — which never reaches Postgres, and therefore keeps nothing warm.
+#
+# 2. THE JOB MUST BE ABLE TO FAIL. `curl` exits 0 on a 401 unless it is told
+#    otherwise, so the empty-secret version above would go GREEN FOREVER while
+#    the project quietly paused. Every step below is written so that a failure
+#    is loud: `set -euo pipefail`, an explicit emptiness check on both secrets,
+#    and `--fail-with-body` so a non-2xx is a non-zero exit (and the response
+#    body still gets printed, which is where PostgREST puts the reason).
+#
+# ## Why `rpc/is_approved` and not a table select
+#
+# It has to be a request that REACHES POSTGRES — a 200 from the gateway proves
+# nothing about the database — and one that a signed-out `anon` caller is
+# allowed to make, or the job would fail forever on a permission error instead
+# of never failing at all.
+#
+# Every table is default-deny under RLS, so a select would be answered without
+# the database necessarily being asked anything interesting. `is_approved()` is
+# `security definer` and executable by `anon` (deliberately — see
+# `supabase/migrations/0006_lock_down_replace_state.sql`), and its body is
+# `select ... from profiles where id = auth.uid()`, i.e. a real table read. For
+# `anon` it returns `false`, which is a 200 with the body `false`. That is the
+# smallest request in the schema that is guaranteed both to run inside Postgres
+# and to succeed.
+name: Keep Supabase warm
+
+on:
+  schedule:
+    # Mondays and Thursdays at 09:00 UTC.
+    - cron: '0 9 * * 1,4'
+  # So the project can be pinged by hand after a restore, without waiting for
+  # the next scheduled run.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run a query inside Postgres
+        env:
+          # `VITE_`-prefixed on purpose: these are the secrets this repo
+          # actually has. See the header.
+          SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+
+          # A missing secret is an empty string, not an error. Without these two
+          # lines the request below would go out unauthenticated to nowhere and
+          # this job would report success while the project paused.
+          if [ -z "${SUPABASE_URL}" ]; then
+            echo "::error::VITE_SUPABASE_URL is empty — the secret is missing or misnamed." >&2
+            exit 1
+          fi
+          if [ -z "${SUPABASE_ANON_KEY}" ]; then
+            echo "::error::VITE_SUPABASE_ANON_KEY is empty — the secret is missing or misnamed." >&2
+            exit 1
+          fi
+
+          # --fail-with-body: non-2xx exits non-zero AND still prints the body,
+          #   which is where PostgREST explains itself.
+          # --silent --show-error: no progress meter, but errors still surface.
+          # --max-time: a hung request must fail the job rather than sit for the
+          #   runner's whole six-hour budget.
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --max-time 30 \
+            --header "apikey: ${SUPABASE_ANON_KEY}" \
+            --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            --header 'Content-Type: application/json' \
+            --data '{}' \
+            "${SUPABASE_URL}/rest/v1/rpc/is_approved"
+          echo
+          echo "Postgres answered — the project is awake."
