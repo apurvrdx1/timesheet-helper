@@ -37,28 +37,33 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # JOB level, not step level, and the first CI run proved why. `npm run
+    # coverage` loads `src/storage/store.ts`, which imports `src/auth/client.ts`,
+    # which throws at MODULE SCOPE when these are absent — so the unit suite
+    # failed before a single test ran, with "VITE_SUPABASE_URL is not set".
+    # Locally that never happens because Vite reads `.env.local`; a runner has
+    # no such file. Anything that imports the app needs these, not just the
+    # step that bundles it.
+    env:
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22', cache: 'npm' }
       - run: npm ci
-      - run: npm run typecheck
-      # Replaces `npm test`, not just adds to it: `coverage` runs the exact
-      # same vitest suite with v8 instrumentation and then enforces
-      # vitest.config.ts's thresholds (80 lines/functions/statements, 75
-      # branches), failing the job — and blocking deploy — if either the
-      # tests or the coverage bar fail. Running `npm test` first would only
-      # duplicate the whole suite for no extra signal.
-      - run: npm run coverage
-      # A missing GitHub secret interpolates to the EMPTY STRING rather than
-      # failing (see keepwarm.yml's header for the same trap). These two are
-      # baked into the bundle at build time and `src/auth/client.ts` throws at
-      # module load without them, so an unguarded build would publish a page
-      # that is blank for every visitor — and go green doing it.
+      # FIRST, before anything that imports the app. A missing GitHub secret
+      # interpolates to the EMPTY STRING rather than failing (see keepwarm.yml's
+      # header for the same trap). These two are baked into the bundle at build
+      # time and `src/auth/client.ts` throws at module load without them, so an
+      # unguarded build would publish a page that is blank for every visitor —
+      # and go green doing it.
+      #
+      # It runs before `coverage` rather than after because that is the
+      # difference between "VITE_SUPABASE_URL is empty — the secret is missing
+      # or misnamed" and a module-load stack trace out of a test runner, which
+      # is what the first run of this workflow actually produced.
       - name: Check the build-time secrets exist
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${VITE_SUPABASE_URL}" ]; then
@@ -69,10 +74,15 @@ jobs:
             echo "::error::VITE_SUPABASE_ANON_KEY is empty — the secret is missing or misnamed." >&2
             exit 1
           fi
+      - run: npm run typecheck
+      # Replaces `npm test`, not just adds to it: `coverage` runs the exact
+      # same vitest suite with v8 instrumentation and then enforces
+      # vitest.config.ts's thresholds (80 lines/functions/statements, 75
+      # branches), failing the job — and blocking deploy — if either the
+      # tests or the coverage bar fail. Running `npm test` first would only
+      # duplicate the whole suite for no extra signal.
+      - run: npm run coverage
       - run: npm run build
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
       - uses: actions/upload-pages-artifact@v3
         with: { path: ./dist }
 
