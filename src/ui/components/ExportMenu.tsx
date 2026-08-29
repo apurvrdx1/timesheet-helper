@@ -85,17 +85,26 @@ async function writeToClipboard(html: string, text: string): Promise<void> {
   ]);
 }
 
+/**
+ * Two details here are load-bearing in Firefox and are the usual reason a
+ * download "does nothing": the anchor must be IN the document when it is
+ * clicked (a synthetic click on a detached node is ignored), and the object
+ * URL must not be revoked in the same tick — the download reads it
+ * asynchronously, so revoking immediately can cancel it. Deferring the
+ * revoke by a tick still frees the blob; leaving it un-revoked would leak
+ * the whole file until the tab closes.
+ */
 function downloadCsv(csv: string, fileName: string): void {
   // A BOM-free UTF-8 file; `text/csv` is what a spreadsheet expects.
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
   const link = document.createElement('a');
   link.href = url;
   link.download = fileName;
+  link.style.display = 'none';
+  document.body.appendChild(link);
   link.click();
-  // Revoking immediately is safe: the click has already handed the blob to
-  // the download, and leaving it un-revoked leaks the whole file until the
-  // tab is closed.
-  URL.revokeObjectURL(url);
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 export function ExportMenu({ personName, monday, entries, otls }: ExportMenuProps) {

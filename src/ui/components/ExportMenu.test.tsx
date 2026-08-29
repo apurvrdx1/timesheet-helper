@@ -43,10 +43,12 @@ class FakeClipboardItem {
 }
 
 let clicked: HTMLAnchorElement | null = null;
+let wasAttachedWhenClicked = false;
 
 beforeEach(() => {
   written = [];
   clicked = null;
+  wasAttachedWhenClicked = false;
   clipboardWrite.mockClear();
   clipboardWriteText.mockClear();
   vi.stubGlobal('ClipboardItem', FakeClipboardItem);
@@ -60,6 +62,7 @@ beforeEach(() => {
     this: HTMLAnchorElement,
   ) {
     clicked = this;
+    wasAttachedWhenClicked = document.body.contains(this);
   });
 });
 
@@ -157,7 +160,11 @@ describe('ExportMenu', () => {
     expect(clicked).not.toBeNull();
     expect(clicked?.download).toBe('Alex-Kim-2026-09-07.csv');
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:stub');
+    // Firefox ignores a synthetic click on a detached anchor, and cancels the
+    // download if the object URL is revoked in the same tick.
+    expect(wasAttachedWhenClicked).toBe(true);
+    expect(document.body.contains(clicked)).toBe(false);
+    await vi.waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:stub'));
   });
 
   it('exports nothing but a header for a week with no hours', async () => {
