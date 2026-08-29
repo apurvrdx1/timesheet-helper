@@ -10,11 +10,25 @@
  *
  * ## What counts as waiting
  *
- * Not approved, AND email already confirmed. The second half matters because
- * `AdminPage` disables Approve until `email_confirmed_at` is set (spec §10),
- * so an unconfirmed registration is not something the owner can act on. A
- * badge counting rows nobody can approve would be a nag that no action clears
- * — this project's named recurring failure mode, in miniature.
+ * An account awaiting its FIRST decision: not approved, email already
+ * confirmed, and never revoked.
+ *
+ * The confirmation half matters because `AdminPage` disables Approve until
+ * `email_confirmed_at` is set (spec §10), so an unconfirmed registration is not
+ * something the owner can act on.
+ *
+ * The revocation half is the same rule met from the other side (pre-merge
+ * review M1). A revoked account also has `approved = false` and a confirmed
+ * address, so it matched too — and the badge said "1 waiting" forever, because
+ * the only in-app action that cleared it was re-approving the person the owner
+ * had just deliberately revoked. `revoked_at`
+ * (`supabase/migrations/0007_revoked_at.sql`) is the column that tells the two
+ * apart; the database writes it from the approved-to-unapproved transition, so
+ * it cannot be forged by a client.
+ *
+ * Both halves exist for one reason: a badge counting rows nobody can act on is
+ * a nag that no action clears — this project's named recurring failure mode, in
+ * miniature.
  *
  * ## Why it is safe to call this at all
  *
@@ -48,7 +62,8 @@ export function usePendingCount(enabled: boolean, refreshKey: unknown): number |
         .from('profiles')
         .select('id', { count: 'exact', head: true })
         .eq('approved', false)
-        .not('email_confirmed_at', 'is', null);
+        .not('email_confirmed_at', 'is', null)
+        .is('revoked_at', null);
 
       if (cancelled) return;
       if (error) {

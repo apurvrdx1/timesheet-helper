@@ -64,6 +64,7 @@ vi.mock('../auth/client', () => {
     update: () => Chain;
     eq: () => Chain;
     not: () => Chain;
+    is: () => Chain;
   }
   const makeChain = (): Chain => {
     const settled = Promise.resolve({
@@ -77,6 +78,7 @@ vi.mock('../auth/client', () => {
       update: () => chain,
       eq: () => chain,
       not: () => chain,
+      is: () => chain,
       then: (onFulfilled, onRejected) => settled.then(onFulfilled, onRejected),
     };
     return chain;
