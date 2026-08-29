@@ -369,6 +369,42 @@ describe('App: the account is still loading', () => {
     expect(screen.queryByRole('status', { name: /loading/i })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /add otl/i })).toBeInTheDocument();
   });
+
+  it('does not blank the planner to a spinner while a later save is in flight', async () => {
+    // The converse of the two tests above, and the reason `isLoadingAccount`
+    // is `status === 'syncing' && !isSafeToWrite` rather than just the status.
+    //
+    // A save sets `status` to `'syncing'` exactly as the mount read does. The
+    // two are only told apart by `isSafeToWrite`, which is false during the
+    // initial read and true forever after. Drop that term and every debounced
+    // push would replace the whole planner with a spinner mid-edit — while
+    // both tests above still passed, because during the mount read the two
+    // conditions agree. This is the case where they disagree.
+    render(<App />);
+    await settle();
+
+    // Hold the write open so the store stays in 'syncing' to assert against.
+    adapterControl.write = () => new Promise(() => {});
+
+    await userEvent.click(screen.getByRole('button', { name: /add otl/i }));
+    const dialog = screen.getByRole('dialog');
+    await userEvent.type(within(dialog).getByLabelText(/project code/i), 'OPEX-ADMIN');
+    await userEvent.type(within(dialog).getByLabelText(/task code/i), 'T0');
+    await userEvent.type(within(dialog).getByLabelText(/expenditure type/i), 'E0');
+    await userEvent.type(within(dialog).getByLabelText(/time reporting/i), 'R0');
+    await userEvent.click(within(dialog).getByLabelText(/category/i));
+    await userEvent.click(await screen.findByRole('option', { name: /^opex$/i }));
+    await userEvent.click(within(dialog).getByRole('button', { name: /^save$/i }));
+
+    // Past the store's 2s debounce, so the push is genuinely in flight.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2300));
+    });
+
+    // The user is still looking at their data, not at a spinner.
+    expect(screen.queryByRole('status', { name: /loading/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /add otl/i })).toBeInTheDocument();
+  });
 });
 
 describe('App: the account it is signed in as', () => {
