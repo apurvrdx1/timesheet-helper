@@ -83,6 +83,13 @@ interface Failures {
   readonly countChangesTo?: number;
   /** `is_approved()` itself fails. */
   readonly approvalError?: string;
+  /**
+   * The HTTP status the failing response reports, for the failure that is
+   * configured above. Left undefined by most tests on purpose: a response
+   * without a status must leave `StorageError.status` null rather than 0,
+   * because 0 is a real and meaningful status here (the fetch never landed).
+   */
+  readonly status?: number;
 }
 
 /**
@@ -144,13 +151,17 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
             data: readonly Row[] | null;
             error: { message: string; code: string; details: string | null; hint: string | null } | null;
             count: number | null;
+            status?: number;
           }) => T,
         ) {
           if (failures.selectTable === table) {
             return Promise.resolve({
               data: null,
               // The shape PostgREST actually sends. `code` is what the adapter
-              // has to carry through for a caller to tell 42501 from 42P01.
+              // has to carry through for a caller to tell 42501 from 42P01;
+              // `status` is what it has to carry through for a caller to tell
+              // an unreachable database from a broken one, because an
+              // unreachable one has no `code` at all.
               error: {
                 message: `relation "${table}" is on fire`,
                 code: '42P01',
@@ -158,6 +169,7 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
                 hint: null,
               },
               count: null,
+              status: failures.status,
             }).then(onFulfilled);
           }
           const all = tables[table] ?? [];
@@ -190,6 +202,7 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
             : {
               data: null,
               error: { message: failures.approvalError, code: '08006', details: null, hint: null },
+              status: failures.status,
             },
         );
       }
@@ -204,6 +217,7 @@ function fakeClient(tables: Tables, failures: Failures = {}): Fake {
               details: null,
               hint: null,
             },
+            status: failures.status,
           },
       );
     },
@@ -781,5 +795,63 @@ describe('createSupabaseAdapter round trip', () => {
     await createSupabaseAdapter(writer.client).write(EMPTY_STATE);
     const reader = fakeClient({ meta: [{ model_hash: null }] });
     await expect(createSupabaseAdapter(reader.client).read()).resolves.toEqual(EMPTY_STATE);
+  });
+});
+
+/**
+ * A sleeping Supabase project is the case these exist for.
+ *
+ * A free project is paused after ~7 days idle, and neither shape it fails with
+ * carries a SQLSTATE: a fetch that never lands reports `code: ''` (postgrest-js
+ * populates `code`/`hint` only for upstream PostgREST/Postgres errors), and a
+ * gateway 503 usually answers with a non-JSON body, from which postgrest-js
+ * builds `{ message: body }` and nothing else. So the status is the only thing
+ * that tells the store "unreachable", and the adapter has to carry it.
+ */
+describe('createSupabaseAdapter: the HTTP status of a failure', () => {
+  it('carries a 503 from a failed select through', async () => {
+    const { client } = fakeClient(FULL_TABLES, { selectTable: 'people', status: 503 });
+    const error = await createSupabaseAdapter(client).read().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(StorageError);
+    expect((error as StorageError).status).toBe(503);
+  });
+
+  it('carries a status 0 — a fetch that never landed — through the approval check', async () => {
+    // The likelier shape for a paused project: the host does not resolve, so
+    // there is no response at all and postgrest-js reports status 0.
+    const { client } = fakeClient(FULL_TABLES, {
+      approvalError: 'TypeError: Failed to fetch',
+      status: 0,
+    });
+    const error = await createSupabaseAdapter(client).read().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(StorageError);
+    // Not `toBeFalsy`: 0 is a real status here and must survive as 0, not
+    // collapse to null the way a missing one does.
+    expect((error as StorageError).status).toBe(0);
+  });
+
+  it('carries the status of a failed write through', async () => {
+    const { client } = fakeClient({}, { rpc: 'service unavailable', rpcCode: '', status: 503 });
+    const error = await createSupabaseAdapter(client).write(EMPTY_STATE).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(StorageError);
+    expect((error as StorageError).status).toBe(503);
+  });
+
+  it('leaves the status null when the adapter itself raised, not the server', async () => {
+    // A short read: the server answered 200 and the adapter refused the result.
+    // There is no failing status to report, and reporting 0 would be a lie the
+    // store would read as "unreachable".
+    const { client } = fakeClient(FULL_TABLES, { countSays: 99 });
+    const error = await createSupabaseAdapter(client).read().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(StorageError);
+    expect((error as StorageError).status).toBeNull();
+  });
+
+  it('leaves the status null when the response carries no status at all', async () => {
+    const { client } = fakeClient(FULL_TABLES, { selectTable: 'people' });
+    const error = await createSupabaseAdapter(client).read().catch((e: unknown) => e);
+    expect((error as StorageError).status).toBeNull();
+    // The existing contract is untouched: `code` still carries.
+    expect((error as StorageError).code).toBe('42P01');
   });
 });

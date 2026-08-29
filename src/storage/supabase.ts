@@ -247,9 +247,22 @@ async function selectOrdered<Row>(
         ? query.order(step.column)
         : query.order(step.column, { nullsFirst: step.nullsFirst });
     }
-    const { data, error, count } = await query.range(rows.length, rows.length + PAGE_SIZE - 1);
+    const { data, error, count, status } = await query.range(
+      rows.length,
+      rows.length + PAGE_SIZE - 1,
+    );
     if (error !== null) {
-      throw new StorageError(`could not read ${table} from Supabase: ${error.message}`, error);
+      // `status` is spelled out rather than spread from `error`, because it is
+      // NOT on the error — postgrest-js puts it on the response envelope. It
+      // has to travel with the rest, because the failure this layer cannot
+      // otherwise describe is a database that never ran anything: a paused
+      // project answers with status 0 or 503 and no useful `code`.
+      throw new StorageError(`could not read ${table} from Supabase: ${error.message}`, {
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+        status,
+      });
     }
     if (count === null || count === undefined) {
       // Asked for `count: 'exact'` and did not get one. Without it there is no
@@ -450,9 +463,14 @@ export function toStatePayload(state: StoredState): StatePayload {
  * expression the policies themselves evaluate.
  */
 async function isApproved(client: SupabaseClient): Promise<boolean> {
-  const { data, error } = await client.rpc(APPROVED_RPC);
+  const { data, error, status } = await client.rpc(APPROVED_RPC);
   if (error !== null && error !== undefined) {
-    throw new StorageError(`could not check approval in Supabase: ${error.message}`, error);
+    throw new StorageError(`could not check approval in Supabase: ${error.message}`, {
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+      status,
+    });
   }
   return data === true;
 }
@@ -547,13 +565,23 @@ export function createSupabaseAdapter(client: SupabaseClient): StorageAdapter {
     },
 
     async write(state: StoredState): Promise<void> {
-      const { error } = await client.rpc(WRITE_RPC, { state: toStatePayload(state) });
+      const { error, status } = await client.rpc(WRITE_RPC, { state: toStatePayload(state) });
       if (error !== null) {
         // `code` is carried, not flattened into the message. A revoked account
         // hits 42501 here, and the caller has to be able to route that to the
         // pending/revoked screen without matching on the English of
         // `new row violates row-level security policy for table "otls"`.
-        throw new StorageError(`could not write state to Supabase: ${error.message}`, error);
+        //
+        // `status` comes from the response envelope, not from `error`, and is
+        // carried for the failure that has no `code` at all — an unreachable
+        // database. Note this is a POST, which postgrest-js does not retry, so
+        // a 503 here is reported on the first attempt.
+        throw new StorageError(`could not write state to Supabase: ${error.message}`, {
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+          status,
+        });
       }
     },
   };

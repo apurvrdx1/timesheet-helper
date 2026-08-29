@@ -82,16 +82,48 @@ export class StorageError extends Error {
   readonly code: string | null;
   readonly details: string | null;
   readonly hint: string | null;
+  /**
+   * The HTTP status the failing response reported, or `null` when there was no
+   * response — the adapter's own refusals (a short read, a missing count, an
+   * unapproved account) raise without one.
+   *
+   * Carried for the same reason `code` is, and for the one case `code` cannot
+   * cover: A DATABASE THAT IS NOT THERE HAS NO SQLSTATE, because nothing in
+   * Postgres ever ran. A paused Supabase project — a free project is paused
+   * after about a week idle — produces two shapes, and neither one carries a
+   * `code` worth branching on:
+   *
+   * * `0` — the fetch itself never landed (DNS, refused connection, offline
+   *   client). postgrest-js reports `code: ''` here deliberately: `code` and
+   *   `hint` describe upstream PostgREST/Postgres failures, and a client-side
+   *   network failure is neither.
+   * * `503` or `520` — something answered, but not the database. The body is
+   *   usually not PostgREST JSON, and postgrest-js then builds the error as
+   *   `{ message: body }` with no `code` at all. (postgrest-js retries both of
+   *   these, but only for GET/HEAD/OPTIONS, so a `POST` rpc reports them on
+   *   the first attempt.)
+   *
+   * `0` is a real value and is not the same as `null`: `null` means the
+   * adapter raised, `0` means the request never reached anything. Anything
+   * reading this must not treat them alike.
+   */
+  readonly status: number | null;
 
   constructor(
     message: string,
-    source: { readonly code?: string | null; readonly details?: string | null; readonly hint?: string | null } = {},
+    source: {
+      readonly code?: string | null;
+      readonly details?: string | null;
+      readonly hint?: string | null;
+      readonly status?: number | null;
+    } = {},
   ) {
     super(message);
     this.name = 'StorageError';
     this.code = source.code ?? null;
     this.details = source.details ?? null;
     this.hint = source.hint ?? null;
+    this.status = source.status ?? null;
   }
 }
 
