@@ -559,9 +559,25 @@ describe('the Supabase storage adapter', () => {
         }],
       },
     });
-    // Specifically NOT 42501. 42501 would mean the body ran and RLS caught it,
-    // which is what the deployed 0005 did.
-    expect(attempt.error?.code, 'anon calling replace_state').toBe('PGRST202');
-    expect(attempt.error?.code).not.toBe('42501');
+    // THE CODE DOES NOT DISCRIMINATE HERE — the message does. Measured live:
+    //
+    //   refused before running (0006, correct):
+    //     42501 "permission denied for function replace_state"
+    //   ran and RLS stopped it (0005, the defect):
+    //     42501 "new row violates row-level security policy for table \"otls\""
+    //
+    // Both are 42501, so an assertion on the code alone cannot tell "anon was
+    // never let in" from "anon ran seven DELETEs and was caught on the way out".
+    // This test originally expected PGRST202, on the assumption that revoking
+    // EXECUTE would make PostgREST report the function as missing. It does not:
+    // PostgREST finds it in the schema cache and Postgres refuses to execute it,
+    // which is a different — and correct — outcome. The control above is what
+    // proves PGRST202 is genuinely what "no such function" looks like, so the
+    // two failures stay distinguishable.
+    expect(attempt.error?.code, 'anon calling replace_state').toBe('42501');
+    expect(attempt.error?.message, 'anon must be refused BEFORE the body runs')
+      .toContain('permission denied for function');
+    expect(attempt.error?.message, 'a body that ran is the 0005 defect')
+      .not.toContain('violates row-level security');
   });
 });
