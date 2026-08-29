@@ -58,6 +58,10 @@ interface ProfileRow {
   is_owner: boolean;
   created_at: string;
   email_confirmed_at: string | null;
+  /** Written by 0007_revoked_at.sql's trigger, never by a client. Non-null
+   *  means this account was approved once and then revoked, which is a
+   *  different state from "has never been decided on". */
+  revoked_at: string | null;
 }
 
 interface AdminProfile {
@@ -67,9 +71,11 @@ interface AdminProfile {
   isOwner: boolean;
   createdAt: string;
   emailConfirmedAt: string | null;
+  revokedAt: string | null;
 }
 
-const SELECT_COLUMNS = 'id, email, approved, is_owner, created_at, email_confirmed_at';
+const SELECT_COLUMNS =
+  'id, email, approved, is_owner, created_at, email_confirmed_at, revoked_at';
 
 function toAdminProfile(row: ProfileRow): AdminProfile {
   return {
@@ -79,7 +85,24 @@ function toAdminProfile(row: ProfileRow): AdminProfile {
     isOwner: row.is_owner,
     createdAt: row.created_at,
     emailConfirmedAt: row.email_confirmed_at,
+    revokedAt: row.revoked_at,
   };
+}
+
+/**
+ * Three states, not two (review finding L10).
+ *
+ * `approved === false` covers two different people: someone who has never been
+ * decided on, and someone who was approved and then revoked. Calling the second
+ * "Pending approval" reads as though the revoke failed, and invites the owner to
+ * approve them again to make the label go away — the one action that undoes what
+ * they just did. `revoked_at` is what tells them apart, and the database writes
+ * it, so the label cannot disagree with the row.
+ */
+function statusOf(profile: AdminProfile): { variant: 'success' | 'warning' | 'neutral'; label: string } {
+  if (profile.approved) return { variant: 'success', label: 'Approved' };
+  if (profile.revokedAt !== null) return { variant: 'neutral', label: 'Revoked' };
+  return { variant: 'warning', label: 'Pending approval' };
 }
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
@@ -193,8 +216,17 @@ export function AdminPage() {
         return;
       }
 
+      // `revoked_at` is set server-side by 0007's trigger and is not read back
+      // here, so this mirrors the transition locally to keep the row's label
+      // honest until the next load. Only its NULL-ness is ever read
+      // (`statusOf`); the client's clock is not presented as the real revocation
+      // time anywhere.
       setProfiles((current) =>
-        current.map((existing) => (existing.id === target.id ? { ...existing, approved: false } : existing)),
+        current.map((existing) =>
+          existing.id === target.id
+            ? { ...existing, approved: false, revokedAt: new Date().toISOString() }
+            : existing,
+        ),
       );
       setRevokeTarget(null);
     } catch (error: unknown) {
@@ -204,7 +236,11 @@ export function AdminPage() {
     }
   };
 
-  const pendingCount = profiles.filter((profile) => !profile.approved).length;
+  // Must agree with `usePendingCount`'s badge, which counts accounts awaiting
+  // a FIRST decision — a revoked account is not waiting for anything.
+  const pendingCount = profiles.filter(
+    (profile) => !profile.approved && profile.revokedAt === null,
+  ).length;
 
   return (
     <Section variant="section">
@@ -255,8 +291,8 @@ export function AdminPage() {
                     </TableCell>
                     <TableCell>
                       <Badge
-                        variant={profile.approved ? 'success' : 'warning'}
-                        label={profile.approved ? 'Approved' : 'Pending approval'}
+                        variant={statusOf(profile).variant}
+                        label={statusOf(profile).label}
                       />
                     </TableCell>
                     <TableCell>

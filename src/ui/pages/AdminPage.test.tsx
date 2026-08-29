@@ -35,6 +35,7 @@ interface ProfileRow {
   is_owner: boolean;
   created_at: string;
   email_confirmed_at: string | null;
+  revoked_at: string | null;
 }
 
 interface ListResult {
@@ -120,6 +121,7 @@ const OWNER: ProfileRow = {
   is_owner: true,
   created_at: '2026-01-01T00:00:00.000Z',
   email_confirmed_at: '2026-01-01T00:00:00.000Z',
+  revoked_at: null,
 };
 
 const PENDING_UNVERIFIED: ProfileRow = {
@@ -129,6 +131,7 @@ const PENDING_UNVERIFIED: ProfileRow = {
   is_owner: false,
   created_at: '2026-08-20T00:00:00.000Z',
   email_confirmed_at: null,
+  revoked_at: null,
 };
 
 const PENDING_VERIFIED: ProfileRow = {
@@ -138,6 +141,7 @@ const PENDING_VERIFIED: ProfileRow = {
   is_owner: false,
   created_at: '2026-08-21T00:00:00.000Z',
   email_confirmed_at: '2026-08-21T00:00:00.000Z',
+  revoked_at: null,
 };
 
 const APPROVED_OTHER: ProfileRow = {
@@ -147,6 +151,18 @@ const APPROVED_OTHER: ProfileRow = {
   is_owner: false,
   created_at: '2026-01-05T00:00:00.000Z',
   email_confirmed_at: '2026-01-05T00:00:00.000Z',
+  revoked_at: null,
+};
+
+const REVOKED: ProfileRow = {
+  id: 'revoked-1',
+  email: 'revoked@example.com',
+  approved: false,
+  is_owner: false,
+  created_at: '2026-02-01T00:00:00.000Z',
+  email_confirmed_at: '2026-02-01T00:00:00.000Z',
+  // Set by the BEFORE UPDATE trigger in 0007_revoked_at.sql, never by a client.
+  revoked_at: '2026-08-25T00:00:00.000Z',
 };
 
 afterEach(() => {
@@ -276,5 +292,33 @@ describe('AdminPage', () => {
     // The row must not have been silently marked approved.
     expect(screen.getByText('Pending approval')).toBeInTheDocument();
     expect(screen.queryByText('Approved')).not.toBeInTheDocument();
+  });
+  it('labels a revoked account as revoked, not as waiting for approval', async () => {
+    // Review finding L10, and the other half of M1. `revoked_at` stopped a
+    // revoked account being COUNTED as waiting (usePendingCount); this is the
+    // same account still being LABELLED as waiting on the page, so the badge
+    // and the table disagreed about the same person.
+    //
+    // "Pending approval" on someone the owner just revoked reads as though the
+    // revoke failed, and invites them to approve it again to make the label go
+    // away — which is the one action that undoes what they meant to do.
+    setCurrentUser('owner-1');
+    mockFrom({ data: [REVOKED, PENDING_VERIFIED], error: null });
+
+    render(<AdminPage />);
+
+    await waitFor(() => expect(screen.getByText(REVOKED.email)).toBeInTheDocument());
+
+    const revokedRow = screen.getAllByRole('row')
+      .find((row) => within(row).queryByText(REVOKED.email) !== null);
+    expect(revokedRow).toBeDefined();
+    expect(within(revokedRow as HTMLElement).getByText('Revoked')).toBeInTheDocument();
+    expect(within(revokedRow as HTMLElement).queryByText('Pending approval')).toBeNull();
+
+    // The control: an account that has never been decided on is still pending,
+    // so the new label cannot have been achieved by relabelling everything.
+    const pendingRow = screen.getAllByRole('row')
+      .find((row) => within(row).queryByText(PENDING_VERIFIED.email) !== null);
+    expect(within(pendingRow as HTMLElement).getByText('Pending approval')).toBeInTheDocument();
   });
 });
