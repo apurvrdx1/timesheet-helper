@@ -410,6 +410,65 @@ delete from auth.users where email like 'rls-%@example.test'
                        or email like 'storage-%@example.test';
 ```
 
+## Running the end-to-end journey
+
+`e2e/journey.spec.ts` is the browser-level counterpart: Playwright drives the shipped app
+against a live Vite dev server and this project. Two tests — the full planner journey
+(setup, allocate, recalculate, override, prove the override survives a second
+recalculation), and the auth gate itself, where an unapproved account gets the waiting
+screen and *not* the planner.
+
+```bash
+npx playwright test
+```
+
+Like the isolation suite it builds its own throwaway accounts and deletes them afterwards
+(`e2e/fixtures.ts`), for the same reason: it runs on every push, and a suite that wrote
+into a standing account would pass exactly once — the second run's `OPEX-ADMIN` collides on
+the primary key and its second "Alex" makes the allocation cell ambiguous.
+
+### Environment variables
+
+| Variable | Where it comes from | What the suite does with it |
+|---|---|---|
+| `VITE_SUPABASE_URL` *(or `SUPABASE_URL`)* | Project URL, above | Passed to the dev server `playwright.config.ts` starts, and used by the fixtures |
+| `VITE_SUPABASE_ANON_KEY` *(or `SUPABASE_ANON_KEY`)* | Publishable key | Passed to the dev server. **Every assertion** goes through it, because every assertion goes through the browser |
+| `SUPABASE_SERVICE_ROLE_KEY` | Project Settings → API → service_role | Fixture setup and teardown only: create a user, flip `profiles.approved`, delete the user |
+
+The first two are already in `.env.local`; only the third has to be supplied, exactly as
+for the isolation suite, and the same warnings apply — never committed, never logged, never
+under a `VITE_` name. There is **no skip path**: a missing variable fails the run loudly
+with a message naming it (`e2e/env.ts`), because a journey that quietly did not run looks
+identical to one that ran and passed.
+
+In CI it is a repository secret, and `.github/workflows/deploy.yml` gives it to the `e2e`
+job **only** — the job that builds and publishes the bundle does not have it.
+
+### The account that must stay unapproved
+
+The gate test needs an account that is signed in and not approved. It is created by
+`createAccount('pending', { approved: false })` in `e2e/fixtures.ts`, it is fresh in every
+run, and **nothing approves it** — not the suite, not a migration, not the owner. The
+fixture reads its `profiles` row back after creating it and fails if `approved` is anything
+but `false`, so the test cannot silently degrade into asserting nothing.
+
+It is deliberately not a standing login. A permanent "pending" account is precisely the
+fixture someone approves by accident while debugging, and the test would keep passing for
+months afterwards while proving the opposite of what it claims. If that test fails, read
+the trace — do not approve an account to find out what happens.
+
+### What a run does to the project
+
+Creates two users (`e2e-<run-id>-{journey,pending}@example.test`), approves one, writes the
+planner rows the journey creates, and deletes both users at the end — then verifies no
+profile or domain row survived, failing loudly if one did.
+
+If a run is interrupted, teardown may not run. Sweep leftovers with:
+
+```sql
+delete from auth.users where email like 'e2e-%@example.test';
+```
+
 ## Bootstrapping the owner account
 
 The first account cannot be approved by anyone, because no owner exists yet. This is a
