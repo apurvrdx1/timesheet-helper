@@ -51,6 +51,51 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with: { path: ./dist }
 
+  # The isolation suite is what proves one admin cannot see another's rows. If
+  # it fails, accounts can read each other's data, and that must block the
+  # deploy — hence `deploy.needs` below, not a nightly cron and not an
+  # informational badge.
+  #
+  # It is its OWN job rather than another step in `e2e`, for three reasons:
+  #
+  #  1. Attribution. "isolation failed" and "the browser journey failed" are
+  #     completely different diagnoses; two jobs give two distinct red marks
+  #     instead of one that has to be opened to be understood.
+  #  2. Cost. `e2e` spends about a minute on `playwright install --with-deps
+  #     chromium`, which this suite has no use for — it runs in `node`, not a
+  #     browser. As a separate job the two run concurrently, so the added wall
+  #     clock is max(), not sum().
+  #  3. Blast radius of the secret. Scoping is per job. Two small jobs that each
+  #     need the key is a narrower grant than one long job that holds it while
+  #     doing unrelated work.
+  #
+  # Running concurrently with `e2e` against the same project is safe by
+  # construction, not by luck: every fixture email is stamped with a per-run id
+  # and the two suites use different prefixes (`rls-`/`storage-` vs `e2e-`).
+  # See supabase/README.md § "What a run does to the project".
+  #
+  # There is no skip path here either. The suites call `requireEnv` at module
+  # load, so a missing or misnamed secret fails the file loudly naming the
+  # variable, rather than reporting a green job that asserted nothing.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - run: npm ci
+      - run: npm run test:integration
+        env:
+          # The repo's secrets carry Vite's `VITE_` prefix because the same two
+          # values are inlined into the bundle; this suite is plain Node and
+          # reads the unprefixed names. The mapping is deliberate and is
+          # tabulated in supabase/README.md § "Two names for the same two
+          # values" — a name that does not match a secret is the empty string,
+          # not an error.
+          SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
   # The end-to-end journey is its own job so that the service-role key is
   # scoped to it and to nothing else. That key bypasses RLS entirely
   # (supabase/README.md § "Credentials"), and the only reason the suite holds
@@ -87,7 +132,7 @@ jobs:
           retention-days: 7
 
   deploy:
-    needs: [build, e2e]
+    needs: [build, integration, e2e]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
