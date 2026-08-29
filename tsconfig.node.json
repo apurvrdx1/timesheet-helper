@@ -27,5 +27,17 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "vitest.integration.config.ts", "src/**/*.integration.test.ts"]
+  // `playwright.config.ts` and `e2e/` join the Node project rather than the
+  // app one: they are Node code (process.env, node:crypto, the service-role
+  // client that builds the run's fixtures) and they were previously checked by
+  // nothing at all — `tsconfig.app.json` includes only `src`, so a type error
+  // in the end-to-end suite could not fail `npm run typecheck`.
+  "include": [
+    "vite.config.ts",
+    "vitest.config.ts",
+    "vitest.integration.config.ts",
+    "playwright.config.ts",
+    "e2e/**/*.ts",
+    "src/**/*.integration.test.ts"
+  ]
 }
