@@ -44,24 +44,67 @@ migration.
 
 ## Credentials
 
-- **Publishable key** (formerly called the "anon" key; env var `VITE_SUPABASE_ANON_KEY`)
-  is a client-side key scoped entirely by RLS. It is meant to be public and ships in the
-  built app. Find it at Project Settings → API → the publishable/anon key. It **cannot**
-  create or alter tables — it can only do what RLS policies allow once they exist.
-- **`VITE_SUPABASE_URL`** is the project URL above.
+- **Publishable key** (formerly called the "anon" key) is a client-side key scoped entirely
+  by RLS. It is meant to be public and ships in the built app. Find it at Project Settings →
+  API → the publishable/anon key. It **cannot** create or alter tables — it can only do what
+  RLS policies allow once they exist.
+- **Project URL** is the URL above.
 - Both live in `.env.local` (already gitignored) for local dev, and must be set as build-time
   environment variables wherever the app is deployed.
 
-**The service-role (secret) key must never be used by this app and must never be committed,
-in this file or anywhere else.** It bypasses RLS entirely — anything holding it can read or
-write every owner's data. Schema changes that require it (like the migrations above) are
-applied by a human, from the dashboard or an authenticated `supabase` CLI session, never
-from application code.
+### Two names for the same two values
 
-There is exactly one exception, and it is not the app: the row-level-security integration
-suite needs the service-role key to build and tear down its fixtures. See
-[Running the isolation suite](#running-the-isolation-suite) for what it does with it and
-why nothing else can. Nothing that ships to a browser ever sees that key.
+Vite only inlines environment variables whose names begin with `VITE_`, so the pair the
+browser needs must carry that prefix. The Node-side suites are not built by Vite and read
+the unprefixed names. **The GitHub repository secrets use the `VITE_` names**, and the
+workflows map across where a suite wants the other spelling.
+
+| Value | Repository secret | App / `playwright.config.ts` read | Node suites read |
+|---|---|---|---|
+| Project URL | `VITE_SUPABASE_URL` | `VITE_SUPABASE_URL` | `SUPABASE_URL`, falling back to `VITE_SUPABASE_URL` |
+| Publishable key | `VITE_SUPABASE_ANON_KEY` | `VITE_SUPABASE_ANON_KEY` | `SUPABASE_ANON_KEY`, falling back to `VITE_SUPABASE_ANON_KEY` |
+| Service-role key | `SUPABASE_SERVICE_ROLE_KEY` | *never — see below* | `SUPABASE_SERVICE_ROLE_KEY` |
+
+The fallbacks are `fromEnv()` in `vitest.integration.config.ts` and in `e2e/env.ts`; in both,
+a real environment variable beats `.env.local`, which is what lets CI inject secrets as
+environment variables and never as files.
+
+Read that table before adding a secret to a workflow. **A GitHub secret that does not exist
+interpolates to the empty string rather than failing**, so a misspelled name produces a green
+job that did nothing — which is precisely what happened to the keep-warm workflow, and why
+`.github/workflows/keepwarm.yml` now opens with an explicit emptiness check on both values.
+
+### The service-role key
+
+It bypasses RLS entirely: anything holding it can read and write every owner's data, and
+delete accounts. The rule is **not** "never use it" — CI genuinely requires it, and a rule
+that has to be broken to ship is a rule that teaches people to ignore rules. It is:
+
+- **Never in the bundle.** Never under a `VITE_` name, never in `.env.local`, never anywhere
+  Vite can see it, because Vite inlines `VITE_`-prefixed values into the published
+  JavaScript. Publishing it would hand every visitor every account's data.
+- **Never committed.** Not in this file, not in a workflow file, not in a fixture, not in a
+  test. It is a repository secret or a shell variable for one command, and nothing else.
+- **Never printed.** Not to a log, not to a CI annotation, not into an error message.
+- **Never in application code.** Nothing under `src/` outside the `*.integration.test.ts`
+  files reads it. Schema changes that need it — the migrations above — are applied by a human
+  from the dashboard or an authenticated `supabase` CLI session.
+- **Permitted as a CI secret, scoped to the jobs that need it and to no others.**
+
+Two jobs need it. Both are test-only, and both need it for the same reason: they create and
+destroy throwaway accounts, and *approving* an account is reserved to the owner while
+*deleting* one is reserved to an admin credential — neither is something the publishable key
+can do, by design.
+
+| Suite | Job in `deploy.yml` | What it does with the key |
+|---|---|---|
+| Isolation suite (`npm run test:integration`) | `integration` | Fixture setup and teardown only; never in an assertion. See [Why the service-role key, and why it cannot be avoided](#why-the-service-role-key-and-why-it-cannot-be-avoided) |
+| End-to-end journey (`npx playwright test`) | `e2e` | Creates the run's accounts, flips `profiles.approved`, deletes them afterwards |
+
+`.github/workflows/deploy.yml` gives `SUPABASE_SERVICE_ROLE_KEY` to those two jobs and to
+nothing else. **The `build` job that compiles and uploads the published bundle does not have
+it**, so the artifact that reaches a browser could not carry it even by mistake. Keep that
+separation: it is the property this whole section exists to protect.
 
 ## `on delete cascade`
 
@@ -368,9 +411,11 @@ SUPABASE_SERVICE_ROLE_KEY="$(npx supabase projects api-keys \
   npm run test:integration
 ```
 
-In CI it must be a repository secret. It must never be committed, never printed to a log,
-and never added to any `VITE_`-prefixed variable — Vite inlines those into the built
-bundle, which would publish it.
+In CI it is a repository secret, and `.github/workflows/deploy.yml` gives it to the
+`integration` job **only** — the job that builds and publishes the bundle does not have it.
+It must never be committed, never printed to a log, and never added to any `VITE_`-prefixed
+variable, because Vite inlines those into the built bundle, which would publish it. See
+[The service-role key](#the-service-role-key) for the rule in full.
 
 ### Why the service-role key, and why it cannot be avoided
 
@@ -442,7 +487,8 @@ with a message naming it (`e2e/env.ts`), because a journey that quietly did not 
 identical to one that ran and passed.
 
 In CI it is a repository secret, and `.github/workflows/deploy.yml` gives it to the `e2e`
-job **only** — the job that builds and publishes the bundle does not have it.
+and `integration` jobs **only** — the job that builds and publishes the bundle does not
+have it.
 
 ### The account that must stay unapproved
 
