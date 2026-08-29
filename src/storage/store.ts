@@ -194,6 +194,41 @@ const REVOKED_NOTICE =
   'tab only — ask the owner to approve the account again and they will be saved on the next change.';
 
 /**
+ * What the app says when it could not reach the database at all.
+ *
+ * The likeliest cause by far is a PAUSED PROJECT: this runs on a free Supabase
+ * project, which is paused after about a week idle.
+ * `.github/workflows/keepwarm.yml` exists to prevent that, but a cron job is a
+ * thing that can fail — a rotated secret, Actions disabled on the repository,
+ * a run that simply did not happen — and when it does, this is the screen
+ * every user meets. The fallback for a failed cron must not mystify.
+ *
+ * Two things it deliberately does NOT do. It does not blame the user's
+ * connection alone, because a paused project looks exactly the same from here.
+ * And it does not imply the answer is instant: waking a paused project takes
+ * about a minute, and postgrest-js has already spent up to 7 seconds retrying
+ * (1s/2s/4s) before this text is even rendered. "Try again" with no sense of
+ * the wait is a sentence the user experiences as a hang.
+ */
+const UNREACHABLE_LOAD_NOTICE =
+  'Could not reach the database. It has most likely gone to sleep — that happens when the ' +
+  'project sits unused, and waking it takes about a minute, so this will not clear straight ' +
+  'away. Wait a minute, then reload this page; if it still fails, check your connection. ' +
+  'Nothing you change here will be saved until it loads.';
+
+/**
+ * The same failure met on the way out rather than on the way in.
+ *
+ * A separate sentence because the advice differs: the data DID load, the state
+ * on screen is real, and there is nothing to reload — the next edit retries on
+ * its own. Telling this user to reload would throw away work for nothing.
+ */
+const UNREACHABLE_SAVE_NOTICE =
+  'Could not reach the database, so your last change was not saved. It has most likely gone to ' +
+  'sleep — waking it takes about a minute, so retrying immediately will probably fail too. Your ' +
+  'changes are kept in this tab, and the next change you make will try again.';
+
+/**
  * What the app says about a push it refused to send.
  *
  * The reason is the whole point: not "saving failed" (which invites a retry)
@@ -236,6 +271,46 @@ function messageOf(error: unknown): string {
  */
 function isNotApproved(error: unknown): boolean {
   return error instanceof StorageError && error.code === INSUFFICIENT_PRIVILEGE;
+}
+
+/**
+ * The statuses that mean "nothing in Postgres ran", as opposed to "Postgres
+ * ran something and it went wrong".
+ *
+ * * `0` — the fetch never landed: DNS did not resolve, the connection was
+ *   refused, or the client is offline. A paused Supabase project's host stops
+ *   resolving, so this is the likelier of the two shapes for one.
+ * * `503` — something in front of the database answered for it.
+ * * `520` — Cloudflare's version of the same.
+ *
+ * `503` and `520` are exactly `postgrest-js`'s own `RETRYABLE_STATUS_CODES`,
+ * which is not a coincidence: it retries them because they are the transient,
+ * nothing-ran failures. It retries GET/HEAD/OPTIONS only, three times, with
+ * 1s/2s/4s backoff — so a failing read can take about 7 seconds to arrive here
+ * while a failing `rpc` (a POST, and both `write` and the approval check are
+ * POSTs) arrives on the first attempt. Either way the notice must not sound
+ * instant.
+ */
+const UNREACHABLE_STATUSES: readonly number[] = [0, 503, 520];
+
+/**
+ * True when the failure is the database not being there, rather than the
+ * database refusing or failing.
+ *
+ * Branches on the STATUS, never on the message — the same rule `isNotApproved`
+ * follows and for the same reason, with one extra pressure behind it here:
+ * these failures have no useful `code` to branch on either. A fetch that never
+ * landed reports `code: ''`, and a 503 whose body is not PostgREST JSON
+ * reports no code at all, so the status is the only signal there is. `null`
+ * status (the adapter raised it itself — a short or torn read) is not in the
+ * list and must not be: that read reached the database perfectly well.
+ */
+function isUnreachable(error: unknown): boolean {
+  return (
+    error instanceof StorageError &&
+    error.status !== null &&
+    UNREACHABLE_STATUSES.includes(error.status)
+  );
 }
 
 /**
@@ -381,6 +456,16 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
           setNotice(REVOKED_NOTICE);
           return;
         }
+        // A NEW branch, deliberately below the 42501 one and deliberately
+        // changing nothing above it: the load epoch is not touched and
+        // `isSafeToWrite` stays as it was, exactly as on the generic error
+        // path below. The state on screen still descends from the read, so
+        // the next edit is still the right thing to send.
+        if (isUnreachable(error)) {
+          setStatus('error');
+          setNotice(UNREACHABLE_SAVE_NOTICE);
+          return;
+        }
         setStatus('error');
         setNotice(
           `Could not save to Supabase: ${messageOf(error)}. Your changes are kept in this tab only.`,
@@ -424,6 +509,14 @@ export function useStore(adapter?: StorageAdapter): StoreApi {
         if (isNotApproved(error)) {
           setStatus('forbidden');
           setNotice(NOT_APPROVED_NOTICE);
+          return;
+        }
+        // Below the approval check on purpose: an RLS refusal arrives as a
+        // 403, which is not in `UNREACHABLE_STATUSES`, but "not approved" is
+        // the more specific and more actionable fact either way and must win.
+        if (isUnreachable(error)) {
+          setStatus('error');
+          setNotice(UNREACHABLE_LOAD_NOTICE);
           return;
         }
         setStatus('error');

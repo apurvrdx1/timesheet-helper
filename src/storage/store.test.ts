@@ -983,3 +983,187 @@ describe('useStore: a push never destroys the certificate of a schedule it kept'
     expect(reloaded.result.current.hasCertifiedSchedule).toBe(true);
   });
 });
+
+/**
+ * A sleeping database is not a broken one, and the difference is actionable.
+ *
+ * The Supabase project this app runs on is a free one, and a free project is
+ * paused after about a week idle. `.github/workflows/keepwarm.yml` exists to
+ * stop that happening, but a cron job is a thing that can fail — a rotated
+ * secret, a repository with Actions disabled, a run that was skipped — and
+ * when it does, the paused project is what every user meets on load. Telling
+ * them "could not load your data (TypeError: Failed to fetch)" is true and
+ * useless; the fallback for a failed cron must not mystify.
+ *
+ * Two shapes, because that is what the failure actually looks like — a fetch
+ * that never lands reports status 0, a gateway that answers for a database
+ * that cannot reports 503 (or 520 from Cloudflare). The status is the only
+ * thing that separates them from a broken database, since neither carries a
+ * SQLSTATE.
+ */
+describe('useStore: a database that cannot be reached', () => {
+  /** The shape postgrest-js produces when the fetch itself never landed. */
+  const fetchFailed = (): StorageError =>
+    new StorageError('TypeError: Failed to fetch', { code: '', status: 0 });
+
+  /** The shape it produces when something answered but the database did not. */
+  const unavailable = (status: number): StorageError =>
+    new StorageError('<html>503 Service Unavailable</html>', { status });
+
+  it('names the sleeping database when the fetch never landed (status 0)', async () => {
+    const adapter = adapterFailingToRead(fetchFailed());
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).toMatch(/asleep|sleep/i);
+    // Not approval, and not a fault the user can do anything else about.
+    expect(result.current.notice).not.toMatch(/not approved/i);
+    expect(result.current.isSafeToWrite).toBe(false);
+  });
+
+  it('names it for a 503 too — the same failure, a different shape', async () => {
+    const adapter = adapterFailingToRead(unavailable(503));
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).toMatch(/asleep|sleep/i);
+    expect(result.current.isSafeToWrite).toBe(false);
+  });
+
+  it('names it for a 520 — Cloudflare in front of the same dead database', async () => {
+    const adapter = adapterFailingToRead(unavailable(520));
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).toMatch(/asleep|sleep/i);
+  });
+
+  it('does not promise an instant answer', async () => {
+    // Waking a paused project takes about a minute, and postgrest-js retries a
+    // 503 three times with 1s/2s/4s backoff before the failure even surfaces.
+    // "Try again" with no sense of the wait is a message the user experiences
+    // as a hang, so the notice has to name the delay.
+    const adapter = adapterFailingToRead(fetchFailed());
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).toMatch(/minute/i);
+  });
+
+  it('leaves a genuinely broken database as the generic error', async () => {
+    // 500 is the server failing, not the server being absent. Nothing here
+    // suggests waiting a minute would help, so nothing here should say so.
+    const adapter = adapterFailingToRead(unavailable(500));
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).not.toMatch(/asleep|sleep/i);
+    expect(result.current.notice).toMatch(/could not load/i);
+  });
+
+  it('branches on the status, never on the message', async () => {
+    // The same trap the 42501 branch has a test for. This error SAYS the
+    // database is asleep and is not: it is a 500, and matching on prose would
+    // report a broken server as a sleeping one and tell the user to wait.
+    const adapter = adapterFailingToRead(
+      new StorageError('the database is asleep and will wake in a minute', { status: 500 }),
+    );
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).toMatch(/could not load/i);
+  });
+
+  it('leaves an adapter-raised failure — no status at all — as the generic error', async () => {
+    // A torn or short read. `status` is null, not 0, and the two must not be
+    // conflated: this read reached the database perfectly well.
+    const adapter = adapterFailingToRead(
+      new StorageError('could not read schedule from Supabase: the row count changed'),
+    );
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    expect(result.current.notice).not.toMatch(/asleep|sleep/i);
+  });
+
+  it('still reports 42501 as forbidden, whatever status came with it', async () => {
+    // Ordering matters. RLS refusals arrive as 403s, and "not approved" is the
+    // more specific and more actionable fact — an unreachable-database notice
+    // would send the user to wait for a database that is answering fine.
+    const adapter = adapterFailingToRead(
+      new StorageError('refused', { code: INSUFFICIENT_PRIVILEGE, status: 403 }),
+    );
+    const { result } = renderHook(() => useStore(adapter));
+    await waitFor(() => expect(result.current.status).toBe('forbidden'));
+
+    expect(result.current.notice).toMatch(/not approved/i);
+  });
+
+  it('never sends the debounced push after an unreachable read', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterFailingToRead(fetchFailed());
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+    expect(result.current.status).toBe('error');
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    // The load epoch is untouched by the new branch, so the write guard is
+    // exactly as it was.
+    expect(adapter.write).not.toHaveBeenCalled();
+  });
+
+  it('says so on a failed save too, and keeps the edits in the tab', async () => {
+    vi.useFakeTimers();
+    const adapter = adapterReading();
+    adapter.write.mockRejectedValueOnce(unavailable(503));
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(result.current.status).toBe('error');
+    expect(result.current.notice).toMatch(/asleep|sleep/i);
+    expect(result.current.notice).toMatch(/minute/i);
+    // Not a revocation, and not a reason to throw the user's work away.
+    expect(result.current.model.people).toHaveLength(1);
+    expect(result.current.isSafeToWrite).toBe(true);
+  });
+
+  it('still saves once the database answers again', async () => {
+    // The failed save must not have moved the load epoch or cleared
+    // `isSafeToWrite`: the state on screen still descends from the read.
+    vi.useFakeTimers();
+    const adapter = adapterReading();
+    adapter.write.mockRejectedValueOnce(unavailable(503));
+    const { result } = renderHook(() => useStore(adapter));
+    await settle();
+
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    act(() => {
+      result.current.update(addAPerson);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(adapter.write).toHaveBeenCalledTimes(2);
+    expect(result.current.status).toBe('idle');
+    expect(result.current.notice).toBeNull();
+  });
+});
