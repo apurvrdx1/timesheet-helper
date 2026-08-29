@@ -25,13 +25,69 @@ jobs:
       # tests or the coverage bar fail. Running `npm test` first would only
       # duplicate the whole suite for no extra signal.
       - run: npm run coverage
-      - run: npx playwright install --with-deps chromium
-      - run: npx playwright test
+      # A missing GitHub secret interpolates to the EMPTY STRING rather than
+      # failing (see keepwarm.yml's header for the same trap). These two are
+      # baked into the bundle at build time and `src/auth/client.ts` throws at
+      # module load without them, so an unguarded build would publish a page
+      # that is blank for every visitor — and go green doing it.
+      - name: Check the build-time secrets exist
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VITE_SUPABASE_URL}" ]; then
+            echo "::error::VITE_SUPABASE_URL is empty — the secret is missing or misnamed." >&2
+            exit 1
+          fi
+          if [ -z "${VITE_SUPABASE_ANON_KEY}" ]; then
+            echo "::error::VITE_SUPABASE_ANON_KEY is empty — the secret is missing or misnamed." >&2
+            exit 1
+          fi
       - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
       - uses: actions/upload-pages-artifact@v3
         with: { path: ./dist }
+
+  # The end-to-end journey is its own job so that the service-role key is
+  # scoped to it and to nothing else. That key bypasses RLS entirely
+  # (supabase/README.md § "Credentials"), and the only reason the suite holds
+  # it is to build and tear down the throwaway accounts each run signs in as —
+  # approving an account is the owner's action and there is no owner in a
+  # throwaway run. Nothing that ships to a browser ever sees it: the build job
+  # above does not have it, and the bundle it produces could not use it.
+  #
+  # There is no skip path. If any of the three secrets is missing, the suite
+  # fails loudly naming it (e2e/env.ts's `requireEnv`) rather than passing
+  # vacuously — the whole point of the suite is that the auth gate is proved
+  # through a real browser against a real project.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+        env:
+          # The `VITE_`-prefixed pair is what `playwright.config.ts` hands to
+          # the dev server it starts; the fixtures fall back to it for the
+          # project URL. See e2e/env.ts.
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: test-results/
+          retention-days: 7
+
   deploy:
-    needs: build
+    needs: [build, e2e]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
