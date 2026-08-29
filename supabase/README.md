@@ -542,3 +542,46 @@ If this is run a second time against a different email while an owner already ex
 `one_owner_only` index refuses the write — see `migrations/0002_profiles.sql` above. That
 failure is expected: only one owner may ever exist, and changing who holds the role means
 first clearing the flag on the current owner in the same session.
+
+## Auth rate limits
+
+**Nothing in this repository configures these.** They are project settings in the Supabase
+dashboard (Authentication → Rate Limits), so they do not travel with a migration, a deploy,
+or a `db push`. Restore a project from scratch and they come back at their defaults, not at
+whatever this instance was tuned to. That is why they are written down here rather than
+left to be discovered.
+
+They matter because this app has **open registration**. Anyone who reaches the URL can
+create an account; the approval gate is what stops them seeing data, not what stops them
+signing up. `docs/superpowers/specs/2026-08-27-multi-admin-auth-design.md` §10 lists
+"sign-up rate limiting" as a mitigation for exactly that, and the dashboard is the only
+place it exists.
+
+**Read the current values in the dashboard rather than trusting a number written here.**
+Supabase has changed these defaults, and a stale figure in a README is worse than none —
+it invites someone to assume a limit is in place that is not.
+
+Three are worth a look, in this order:
+
+1. **Email sends.** The one that bites first, and it is not a security setting. Sign-up
+   requires a confirmed email (`mailer_autoconfirm` is off), so the email limit is a hard
+   ceiling on how fast accounts can be created *at all*. The built-in mailer is
+   deliberately restrictive and is not intended for production traffic. Onboarding several
+   admins in one sitting is the realistic way to hit it, and the symptom is unhelpful: the
+   sign-up appears to succeed and no mail ever arrives, leaving an account that can neither
+   sign in nor be approved. If this instance ever needs more than a trickle of sign-ups,
+   configure custom SMTP (Authentication → Emails → SMTP Settings) rather than raising this
+   limit.
+
+2. **Sign-ups / sign-ins per hour per IP.** The actual abuse control for open registration.
+   Every unapproved sign-up costs a row in `auth.users` and `profiles` and a line in the
+   owner's Admin list, so the cost of leaving this generous is a noisy approval queue, not
+   a data breach — RLS holds regardless.
+
+3. **Token refresh.** Least interesting here. The app holds one session per browser and
+   refreshes on Supabase's own schedule; a limit low enough to affect that would affect
+   normal use first, so leave it alone unless something is actually failing.
+
+If you tighten these, note the values somewhere outside the dashboard. The next person to
+debug "sign-up silently does nothing" will look at the code first, and the code is not
+where the answer is.
