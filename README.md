@@ -8,31 +8,106 @@ against each CAPEX code this month. The app produces a Monday-to-Friday schedule
 respects a minimum OPEX commitment, fills every day to 7.5 hours, works around leave, and
 preserves any figure you set by hand.
 
-Single user, no server, no database. It runs entirely in your browser and stores its data
-wherever you point it — a Google Sheet, a Microsoft 365 workbook, or just the browser
-itself.
+Several managers can use one deployment. Each has their own account and sees only their own
+codes, people and schedules — the isolation is enforced by Postgres row-level security, not
+by the app. It is a static site in front of a Supabase project: no server of ours, but an
+account and a network connection are both required.
+
+---
+
+## Accounts and access
+
+Signing up does not get you in. Three things have to be true before an account can use the
+app, and they happen in this order:
+
+1. **Register.** Anyone can, from the sign-in screen. It collects an email and password and
+   grants nothing.
+2. **Confirm the email address.** Supabase sends the link. Until it is clicked the owner
+   cannot approve the account — the Admin page shows the approve button disabled, with the
+   reason next to it.
+3. **Be approved by the owner.** One person holds the owner role. They see an **Admin** tab,
+   listing every account with a badge for how many are waiting, and approve or revoke from
+   there.
+
+Until step 3, the account signs in successfully and gets a waiting screen rather than the
+planner. That is deliberate: every row-level-security policy in the schema requires
+`approved = true`, so an unapproved account handed the planner would meet a page where every
+query returned nothing.
+
+Revoking is not deleting. It stops access immediately and keeps every row the account owns;
+re-approving restores the data exactly as it was. **Deleting a user from the Supabase
+dashboard destroys their data** and is the only thing in the system that does — see
+[`supabase/README.md`](supabase/README.md) § "`on delete cascade`".
+
+### Bootstrapping the owner — the one-time step without which nothing works
+
+The first account cannot be approved by anybody, because approval is the owner's action and
+there is no owner yet. **A fresh deployment is a locked door for everyone, including the
+person who deployed it,** until this is run once by hand.
+
+There is deliberately no in-app path to create an owner: an app that can mint its own owner
+can be talked into minting someone else's.
+
+1. Sign up through the app with the email that will own the instance, and confirm it.
+2. In the Supabase dashboard → SQL Editor, run **once**:
+
+   ```sql
+   update profiles set approved = true, is_owner = true where email = 'THEIR_EMAIL';
+   ```
+
+3. Check it took:
+
+   ```sql
+   select email, approved, is_owner from profiles where email = 'THEIR_EMAIL';
+   -- expect approved = true, is_owner = true
+   ```
+
+Reload the app and the Admin tab appears. Everyone else is approved from there.
+
+Only one owner may ever exist — a `one_owner_only` index refuses a second. Handing the role
+to someone else means clearing the flag on the current owner in the same statement. The
+longer version, including how to find a user id, is in
+[`supabase/README.md`](supabase/README.md) § "Bootstrapping the owner account".
 
 ---
 
 ## Quick start
 
+The app talks to a Supabase project at every start-up and will not run without one. Set up
+the project first — [`supabase/README.md`](supabase/README.md) covers creating it, applying
+the migrations in order, and where to find the two values below.
+
 ```bash
 npm install
+# create .env.local with the two values below, then:
 npm run dev
 ```
 
-That's it. The app opens on browser-local storage and is immediately usable — no account,
-no configuration. Connecting a spreadsheet is optional and can be done later without
-losing anything.
+`.env.local` (gitignored) needs exactly two lines:
+
+```
+VITE_SUPABASE_URL=https://<your-project>.supabase.co
+VITE_SUPABASE_ANON_KEY=<the publishable / anon key>
+```
+
+Both are safe to hold in a browser — the publishable key grants nothing on its own; every
+table it can reach is gated by row-level security. Without them the app throws on load with
+a message naming the missing variable, rather than rendering something broken. **The
+service-role key is not one of these and must never appear here** — Vite inlines
+`VITE_`-prefixed values into the published bundle.
 
 | Command | What it does |
 |---|---|
 | `npm run dev` | Development server |
 | `npm run build` | Type-check and build to `dist/` |
-| `npm test` | Run the test suite |
-| `npm run coverage` | Tests plus coverage thresholds (this is the CI gate) |
+| `npm test` | The unit and component suite — no network, no credentials |
+| `npm run coverage` | The same suite plus coverage thresholds (this is the CI gate) |
 | `npm run typecheck` | `tsc -b` — the real type check |
+| `npm run test:integration` | Row-level-security isolation, against the real project |
 | `npx playwright test` | The end-to-end journey, in a real browser |
+
+The last two need credentials including a service-role key and are documented in
+[`supabase/README.md`](supabase/README.md). The first four need nothing.
 
 Requires Node 22+ and React 19.
 
@@ -87,49 +162,19 @@ That last one is the point of the app, and it is the behaviour most heavily test
 
 ---
 
-## Connecting a spreadsheet
+## Getting a week out
 
-Optional. The app works fully without one; this is for keeping data across machines.
+Each person's week on the Weeks page has an **Export** menu with two options, because the
+week leaves for two different destinations:
 
-Both backends use the **same eight tabs with the same columns**, so a Sheet and a workbook
-hold interchangeable data.
+- **Copy as table** puts the week on the clipboard as both HTML and plain text, so it
+  arrives in email or Slack as a real table with all four OTL identifier columns intact.
+  This is the daily path — someone reads it and types the figures into the corporate system.
+- **Download CSV** saves `<person>-<monday>.csv` for a spreadsheet.
 
-### Google Sheets
-
-Full instructions in [`apps-script/README.md`](apps-script/README.md). In short:
-
-1. New Sheet → **Extensions → Apps Script**
-2. Paste [`apps-script/Code.gs`](apps-script/Code.gs)
-3. **Project Settings → Script properties** → add `SHARED_SECRET` with a long random
-   string
-4. **Deploy → New deployment → Web app**, execute as **Me**, access **Anyone**. Keep the
-   `/exec` URL
-
-Then open connection settings in the app and paste the URL and the same secret.
-
-> **The secret never goes in the code.** It lives in Script Properties on Google's side and
-> in your browser's local storage on this side. This repository is public, and the file you
-> paste is byte-identical to the one committed here — there is nothing to accidentally
-> commit. Changing the secret later takes effect immediately, with no redeployment.
-
-*Caveat:* a Workspace domain may forbid deploying with access set to *Anyone*. Personal
-accounts do not.
-
-### Microsoft 365
-
-Full instructions in [`docs/microsoft-setup.md`](docs/microsoft-setup.md). Uses MSAL
-sign-in and the Graph Excel API, so access is governed by the workbook's own sharing rather
-than a shared secret.
-
-Two things that catch everyone:
-
-- The Entra app registration's redirect URI **must be registered as "Single-page
-  application", not "Web".** A Web redirect rejects the PKCE flow a static site has to use,
-  and the error does not say so.
-- On a **work or school account an administrator may need to approve the app** before
-  sign-in works. Personal Microsoft accounts self-consent. No code can route around this.
-
-MSAL loads on demand, so it costs nothing unless you actually pick this backend.
+A zero is an em-dash in the copied table, matching the screen, and an **empty cell** in the
+CSV. That difference is deliberate: an em-dash in a CSV is text to a spreadsheet, and one of
+them breaks every formula in its column.
 
 ---
 
@@ -137,9 +182,11 @@ MSAL loads on demand, so it costs nothing unless you actually pick this backend.
 
 ```
 src/domain/     Pure TypeScript. The optimizer. No React, no I/O, no randomness.
-src/storage/    One StorageAdapter interface, three backends behind it.
-src/ui/         Astryx components. Three pages.
-apps-script/    The script you paste into your Sheet.
+src/auth/       The Supabase client, the session hook, and the sign-in / waiting gate.
+src/storage/    The single Supabase adapter, and the store that owns the write rule.
+src/ui/         Astryx components. Four pages, one of them owner-only.
+supabase/       Numbered migrations, and the schema and RLS documentation.
+e2e/            The Playwright journey, against a real project in a real browser.
 ```
 
 The domain layer is the interesting part. Everything is **integer half-hour blocks** — a
@@ -148,9 +195,17 @@ inputs always produce byte-identical output. It carries a runtime conservation c
 reconciles hours placed plus hours carried forward against hours available; during
 development that check caught two bugs nobody had in mind when it was written.
 
-Storage is genuinely modular: the connection form is generated from each adapter's own
-`validate()` and field list, and no backend name appears anywhere under `src/ui/`. Adding a
-fourth provider means touching `src/storage/` and nothing else.
+`src/storage/store.ts` is the other place worth reading before changing anything. A save is
+a whole-account replace inside one transaction, which makes writing a state the app invented
+— an empty model shown while a read was failing, say — not a partial save but a deletion of
+everything the account had. The store therefore refuses to write any state that does not
+descend from a completed, authorised read, and the comment at the top of the file explains
+why a boolean was not enough to prove that.
+
+Isolation is the database's job, not the app's. Nothing in `src/` filters by account: RLS
+policies in `supabase/migrations/0003_rls.sql` decide which rows a query can see at all, and
+[`supabase/README.md`](supabase/README.md) documents them along with the queries that verify
+they are applied.
 
 Visual decisions are governed by [`DESIGN.md`](DESIGN.md), grounded in the Astryx design
 system.
@@ -159,15 +214,22 @@ system.
 
 ## Known limitations
 
+- **The app needs a network connection and an approved account.** There is no offline mode
+  and no local fallback. If the account read fails, the app shows a banner saying so and
+  refuses to save anything you do afterwards — a save replaces the whole account, so writing
+  a state that never came from a successful read would delete everything in it. Nothing is
+  lost from the database, but nothing typed in that state is kept either.
+- **On the free Supabase tier the project sleeps after about a week idle**, and the first
+  visitor then meets a "could not reach the database" notice for the minute it takes to wake.
+  `.github/workflows/keepwarm.yml` pings it twice a week to prevent this; if that workflow is
+  disabled or its secrets are rotated, the pausing comes back.
+- **Two tabs on one account is last-writer-wins, and it loses more than the cell.** Because a
+  save replaces the whole account, the losing tab discards every change the other tab made
+  since they diverged, not just the field being edited. Accepted debt for this release; the
+  fix (an optimistic-concurrency check on `meta.model_hash`) is described in
+  `src/storage/store.ts`.
 - **People cannot be renamed.** Delete-and-re-add would orphan that person's allocations,
   which key on their id.
-- **If a sheet header breaks, repair it and *reload* — do not press Connect.** The app
-  protects a tab it cannot read, but if you edited that data in the app first, connecting
-  will write your in-app version over the repaired rows. Reloading loads the sheet
-  correctly.
-- **`apps-script/Code.gs` has no automated tests.** It runs in Google's runtime and cannot
-  be exercised from this repository. It is also the code that clears and rewrites your
-  spreadsheet, which makes it the first thing worth hardening.
 - The Weeks page recomputes its own schedule rather than rendering the stored one. The two
   agree in every state that has been tested, but they are two computations of the same
   thing.
@@ -177,9 +239,23 @@ system.
 ## Deploying
 
 Pushing to `main` builds and publishes to GitHub Pages via
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml). The workflow runs
-type-checking, the coverage gate and the end-to-end journey before it will deploy, so a
-regression blocks the release rather than shipping.
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml). Three jobs must pass before
+it will deploy: the type check and coverage gate, the row-level-security isolation suite, and
+the end-to-end journey. A regression blocks the release rather than shipping.
+
+Three repository secrets are needed, and a missing one is the empty string rather than an
+error, so the names matter:
+
+| Secret | Used by |
+|---|---|
+| `VITE_SUPABASE_URL` | The build, the test suites, and the keep-warm ping |
+| `VITE_SUPABASE_ANON_KEY` | The same three |
+| `SUPABASE_SERVICE_ROLE_KEY` | The isolation and end-to-end jobs **only** — never the build |
+
+The build job checks the first two are non-empty before it runs, because Vite would
+otherwise happily produce a bundle that is blank for every visitor and report success. The
+service-role key is scoped away from the job that produces the bundle on purpose;
+[`supabase/README.md`](supabase/README.md) § "The service-role key" states the rule and why.
 
 **GitHub Pages must be enabled first:** Settings → Pages → Source: **GitHub Actions**.
 Until it is, the build succeeds and the deploy step fails with *"Ensure GitHub Pages has

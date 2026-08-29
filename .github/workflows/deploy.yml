@@ -1,22 +1,79 @@
 name: Deploy to GitHub Pages
+# `build`, `integration` and `e2e` run on pull requests as well as on pushes to
+# `main`; `deploy` runs on a push to `main` and on nothing else (see its `if:`).
+#
+# Before this, `push: main` was the only trigger in the repository, so the three
+# suites `deploy` depends on ran for the first time AFTER the merge that
+# introduced the code — merging was itself their first execution, and no check
+# could ever be a required status check on a pull request because no check ever
+# ran on a pull-request ref.
+#
+# `pull_request` — not `pull_request_target`, and not `workflow_dispatch` as a
+# stand-in. `pull_request_target` would run this file's jobs with the
+# repository's secrets against a contributor's unreviewed code; and dispatching
+# the workflow on a branch to "see it go green" would BUILD THAT BRANCH AND
+# PUBLISH IT to the live site, which is what the `if:` on `deploy` now prevents.
+#
+# Note for a fork's pull request: GitHub does not pass secrets to a workflow
+# triggered by `pull_request` from a fork, so "Check the build-time secrets
+# exist" fails there by design, naming the missing variable, rather than
+# building a blank page or leaking a key to unreviewed code.
 on:
   push: { branches: [main] }
+  pull_request: { branches: [main] }
   workflow_dispatch:
 permissions:
   contents: read
   pages: write
   id-token: write
+# Keyed on the REF, not just on "pages". With pull requests now building, a
+# single shared `pages` group with `cancel-in-progress` would let a pull-request
+# run cancel an in-flight deploy of `main` — a green PR check silently killing
+# the release of the commit before it. Per-ref keeps the useful half (a new push
+# to a branch supersedes that branch's own running checks) and drops that.
 concurrency:
-  group: pages
+  group: pages-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
+    # JOB level, not step level, and the first CI run proved why. `npm run
+    # coverage` loads `src/storage/store.ts`, which imports `src/auth/client.ts`,
+    # which throws at MODULE SCOPE when these are absent — so the unit suite
+    # failed before a single test ran, with "VITE_SUPABASE_URL is not set".
+    # Locally that never happens because Vite reads `.env.local`; a runner has
+    # no such file. Anything that imports the app needs these, not just the
+    # step that bundles it.
+    env:
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22', cache: 'npm' }
       - run: npm ci
+      # FIRST, before anything that imports the app. A missing GitHub secret
+      # interpolates to the EMPTY STRING rather than failing (see keepwarm.yml's
+      # header for the same trap). These two are baked into the bundle at build
+      # time and `src/auth/client.ts` throws at module load without them, so an
+      # unguarded build would publish a page that is blank for every visitor —
+      # and go green doing it.
+      #
+      # It runs before `coverage` rather than after because that is the
+      # difference between "VITE_SUPABASE_URL is empty — the secret is missing
+      # or misnamed" and a module-load stack trace out of a test runner, which
+      # is what the first run of this workflow actually produced.
+      - name: Check the build-time secrets exist
+        run: |
+          set -euo pipefail
+          if [ -z "${VITE_SUPABASE_URL}" ]; then
+            echo "::error::VITE_SUPABASE_URL is empty — the secret is missing or misnamed." >&2
+            exit 1
+          fi
+          if [ -z "${VITE_SUPABASE_ANON_KEY}" ]; then
+            echo "::error::VITE_SUPABASE_ANON_KEY is empty — the secret is missing or misnamed." >&2
+            exit 1
+          fi
       - run: npm run typecheck
       # Replaces `npm test`, not just adds to it: `coverage` runs the exact
       # same vitest suite with v8 instrumentation and then enforces
@@ -25,13 +82,106 @@ jobs:
       # tests or the coverage bar fail. Running `npm test` first would only
       # duplicate the whole suite for no extra signal.
       - run: npm run coverage
-      - run: npx playwright install --with-deps chromium
-      - run: npx playwright test
       - run: npm run build
       - uses: actions/upload-pages-artifact@v3
         with: { path: ./dist }
+
+  # The isolation suite is what proves one admin cannot see another's rows. If
+  # it fails, accounts can read each other's data, and that must block the
+  # deploy — hence `deploy.needs` below, not a nightly cron and not an
+  # informational badge.
+  #
+  # It is its OWN job rather than another step in `e2e`, for three reasons:
+  #
+  #  1. Attribution. "isolation failed" and "the browser journey failed" are
+  #     completely different diagnoses; two jobs give two distinct red marks
+  #     instead of one that has to be opened to be understood.
+  #  2. Cost. `e2e` spends about a minute on `playwright install --with-deps
+  #     chromium`, which this suite has no use for — it runs in `node`, not a
+  #     browser. As a separate job the two run concurrently, so the added wall
+  #     clock is max(), not sum().
+  #  3. Blast radius of the secret. Scoping is per job. Two small jobs that each
+  #     need the key is a narrower grant than one long job that holds it while
+  #     doing unrelated work.
+  #
+  # Running concurrently with `e2e` against the same project is safe by
+  # construction, not by luck: every fixture email is stamped with a per-run id
+  # and the two suites use different prefixes (`rls-`/`storage-` vs `e2e-`).
+  # See supabase/README.md § "What a run does to the project".
+  #
+  # There is no skip path here either. The suites call `requireEnv` at module
+  # load, so a missing or misnamed secret fails the file loudly naming the
+  # variable, rather than reporting a green job that asserted nothing.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - run: npm ci
+      - run: npm run test:integration
+        env:
+          # The repo's secrets carry Vite's `VITE_` prefix because the same two
+          # values are inlined into the bundle; this suite is plain Node and
+          # reads the unprefixed names. The mapping is deliberate and is
+          # tabulated in supabase/README.md § "Two names for the same two
+          # values" — a name that does not match a secret is the empty string,
+          # not an error.
+          SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+  # The end-to-end journey is its own job so that the service-role key is
+  # scoped to it and to nothing else. That key bypasses RLS entirely
+  # (supabase/README.md § "Credentials"), and the only reason the suite holds
+  # it is to build and tear down the throwaway accounts each run signs in as —
+  # approving an account is the owner's action and there is no owner in a
+  # throwaway run. Nothing that ships to a browser ever sees it: the build job
+  # above does not have it, and the bundle it produces could not use it.
+  #
+  # There is no skip path. If any of the three secrets is missing, the suite
+  # fails loudly naming it (e2e/env.ts's `requireEnv`) rather than passing
+  # vacuously — the whole point of the suite is that the auth gate is proved
+  # through a real browser against a real project.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+        env:
+          # The `VITE_`-prefixed pair is what `playwright.config.ts` hands to
+          # the dev server it starts; the fixtures fall back to it for the
+          # project URL. See e2e/env.ts.
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: test-results/
+          retention-days: 7
+
+  # The ONLY job that touches the live site, and the only one with a trigger
+  # guard. `github.event_name == 'push'` alone would already exclude every
+  # pull-request event (`pull_request` and `pull_request_target` are their own
+  # event names) and every manual dispatch (`workflow_dispatch`); the `github.ref`
+  # half is a second, independent barrier, since a pull-request run's ref is
+  # `refs/pull/<n>/merge` and a dispatch carries the ref it was dispatched from.
+  # Both must hold, so publishing a branch to the live site takes a push to
+  # `main` — i.e. a merge — and nothing else can do it. (This also closes review
+  # L9: `workflow_dispatch` had no ref guard and would have published whatever
+  # branch it was dispatched from.)
+  #
+  # The guard is on `deploy` rather than on the workflow's triggers because the
+  # other three jobs are exactly what must run on a pull request.
   deploy:
-    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, integration, e2e]
     runs-on: ubuntu-latest
     environment:
       name: github-pages

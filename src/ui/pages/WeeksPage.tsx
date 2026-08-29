@@ -27,6 +27,7 @@ import { Layout, LayoutContent } from '@astryxdesign/core/Layout';
 import { WeekAccordion } from '../components/WeekAccordion';
 import { LeaveDialog } from '../components/LeaveDialog';
 import { PersonWeekView } from '../components/PersonWeekView';
+import { ExportMenu } from '../components/ExportMenu';
 import { weeksTouchingMonth, weekDays } from '../../domain/calendar';
 import { scheduleAll } from '../../domain/schedule';
 import { blocksToHours } from '../../domain/blocks';
@@ -195,6 +196,11 @@ export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProp
   const viewingPersonName = viewing
     ? (model.people.find((person) => person.id === viewing.personId)?.name ?? '')
     : '';
+  // Computed once and handed to both the view and the export, so the two can
+  // never disagree about which week is on screen (A12).
+  const viewingEntries = viewing
+    ? entriesForPersonWeek(scheduleResult.entries, viewing.personId, viewing.monday)
+    : [];
 
   return (
     <Stack gap={6}>
@@ -278,12 +284,26 @@ export function WeeksPage({ model, month, update, onMonthChange }: WeeksPageProp
           content={
             <LayoutContent>
               {viewing && (
-                <PersonWeekView
-                  personName={viewingPersonName}
-                  monday={viewing.monday}
-                  entries={entriesForPersonWeek(scheduleResult.entries, viewing.personId, viewing.monday)}
-                  otls={model.otls}
-                />
+                <VStack gap={4}>
+                  {/* Outside PersonWeekView's card, not inside it: the card
+                      is the thing being read off and printed (its print
+                      styles hide everything else on the page), so a control
+                      belongs beside it rather than in it. */}
+                  <HStack hAlign="end" vAlign="center">
+                    <ExportMenu
+                      personName={viewingPersonName}
+                      monday={viewing.monday}
+                      entries={viewingEntries}
+                      otls={model.otls}
+                    />
+                  </HStack>
+                  <PersonWeekView
+                    personName={viewingPersonName}
+                    monday={viewing.monday}
+                    entries={viewingEntries}
+                    otls={model.otls}
+                  />
+                </VStack>
               )}
             </LayoutContent>
           }

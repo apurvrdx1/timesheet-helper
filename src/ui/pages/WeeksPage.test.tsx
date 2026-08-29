@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { WeeksPage } from './WeeksPage';
@@ -274,5 +274,66 @@ describe('WeeksPage — one continuous schedule (spec §3.4)', () => {
     render(<WeeksPage model={onLeave} month="2026-09" update={vi.fn()} onMonthChange={vi.fn()} />);
     // The manager's full 37.5h plus the two days the report is not on leave.
     expect(screen.getByText('team capacity 52.5h')).toBeInTheDocument();
+  });
+});
+
+/**
+ * A12: `ExportMenu` is only worth having if something mounts it. These drive
+ * it through the real path a user takes — open a week, open a person's
+ * read-off view, export — rather than rendering the component directly, so
+ * a regression that unmounts it fails here.
+ */
+describe('WeeksPage — export from the person-week view', () => {
+  let written: { flavours: Record<string, Blob> }[] = [];
+  const clipboardWrite = vi.fn(async (items: { flavours: Record<string, Blob> }[]) => {
+    written = items;
+  });
+
+  class FakeClipboardItem {
+    readonly flavours: Record<string, Blob>;
+    constructor(flavours: Record<string, Blob>) {
+      this.flavours = flavours;
+    }
+  }
+
+  beforeEach(() => {
+    written = [];
+    clipboardWrite.mockClear();
+    // jsdom has neither of these; the component throws without them.
+    vi.stubGlobal('ClipboardItem', FakeClipboardItem);
+    Object.defineProperty(globalThis.navigator, 'clipboard', {
+      value: { write: clipboardWrite, writeText: vi.fn() },
+      configurable: true, writable: true,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function openAlexsWeek() {
+    render(<WeeksPage model={model} month="2026-09" update={vi.fn()} onMonthChange={vi.fn()} />);
+    await userEvent.click(screen.getByText(/7 – 11 Sep 2026/));
+    await userEvent.click(screen.getByRole('button', { name: /view alex's week/i }));
+    return screen.getByRole('dialog');
+  }
+
+  it('offers an Export control beside the person-week view', async () => {
+    const dialog = await openAlexsWeek();
+    expect(within(dialog).getByRole('table', { name: /alex week/i })).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: /export/i })).toBeInTheDocument();
+  });
+
+  it('copies the week that is on screen, not some other week', async () => {
+    const dialog = await openAlexsWeek();
+    await userEvent.click(within(dialog).getByRole('button', { name: /export/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /copy as table/i }));
+
+    expect(clipboardWrite).toHaveBeenCalledTimes(1);
+    const html = await written[0]?.flavours['text/html']?.text();
+    expect(html).toContain('<table');
+    expect(html).toContain('OPEX-ADMIN');
+    // A full week on the default OPEX code: five 7.5h days.
+    expect(html).toContain('<td>37.5</td>');
   });
 });

@@ -262,7 +262,7 @@ against it, and clearing all overrides for a week. `Dialog` for add/edit forms u
 button are enough.
 
 ### Toast
-Transient confirmations: saved to Sheet, export complete, recalculation finished. Never for
+Transient confirmations: saved, export complete, recalculation finished. Never for
 errors that need a decision — those are Banners.
 
 ### Selector / DropdownMenu
@@ -299,8 +299,14 @@ Bad: "Invalid input."
 Good: "42.0h of P-1001 couldn't be placed this month. Carried forward to October."
 
 **Loading.** This app computes locally and in milliseconds. Use no spinner for
-recalculation. Only Google Sheet sync gets a loading state, and it's a `Toast`, not a
-blocking overlay.
+recalculation — a spinner over work that has already finished says the wait is the app's
+when it is not. A genuine network round trip is the exception: signing in, loading the
+account and saving it are real waits on Supabase, and may show a loading state.
+
+Two shapes, decided by whether there is anything on screen yet. `AuthGate`'s `Spinner`
+while the initial auth session resolves is approved: nothing has been drawn, so there is
+nothing else to show. Once the app is drawn, a sync says so in a `Toast` or a `Banner` and
+never behind a blocking overlay.
 
 ---
 
