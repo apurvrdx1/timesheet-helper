@@ -19,7 +19,7 @@
  * storage module reaches into `ui/` — the formatting rule genuinely lives
  * there (DESIGN.md §2.2) and duplicating it is the worse trade.
  */
-import { formatHoursCell } from '../ui/format';
+import { formatHoursCell } from './format';
 
 /** One OTL across one Monday–Friday week. Every numeric field is hours. */
 export interface ExportRow {

@@ -20,7 +20,7 @@ import { Text } from '@astryxdesign/core/Text';
 import { DropdownMenu } from '@astryxdesign/core/DropdownMenu';
 import { blocksToHours } from '../../domain/blocks';
 import { weekDays } from '../../domain/calendar';
-import { toCsv, toHtmlTable, type ExportRow } from '../../storage/csv';
+import { toCsv, toHtmlTable, type ExportRow } from '../csv';
 import type { IsoDate, Otl, ScheduleEntry } from '../../domain/types';
 
 export interface ExportMenuProps {
